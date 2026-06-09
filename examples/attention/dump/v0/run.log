@@ -1,0 +1,210 @@
+(.venv) gta@AIRBMGG31C91:~/smarcink/Xe-Forge$ xe-forge -i examples/attention/1_FlashAttention_Fwd.py -s examples/attention/1_FlashAttention_Fwd.yaml -o /examples/attention/dump/v0/optimized_kernel.py
+============================================================
+XE-FORGE
+============================================================
+Input: examples/attention/1_FlashAttention_Fwd.py
+Kernel: kernel
+Device: xpu
+DSL: triton
+Model: gpt-5.5
+Spec: examples/attention/1_FlashAttention_Fwd.yaml (variant: (auto-resolved from spec))
+Stages: all
+Best@k: 1
+Correctness: enabled (tolerances from spec, fallback to config defaults)
+============================================================
+
+Test configuration from spec:
+  Variant: bench-gpu
+  Input shapes: [(1, 40, 16384, 128), (1, 40, 16384, 128), (1, 40, 16384, 128)]
+  FLOP: 5,497,558,138,880
+
+Executor: KernelBenchExecutor (device=xpu)
+No PyTorch reference file found at examples/attention/1_FlashAttention_Fwd_pytorch.py
+WARNING:xe_forge.engines.dspy_engine:VTune not found at 'vtune', profiling disabled.
+Engine: dspy
+Trials: enabled (max=10, dir=./trials)
+VTune: enabled (bin=vtune)
+INFO:xe_forge.knowledge.loader:Loaded 15/15 examples from knowledge_base/triton/xpu/examples
+INFO:xe_forge.knowledge.loader:Knowledge base loaded (dsl=triton, device=xpu): 88 patterns ({'algorithmic': 6, 'dtype_fix': 3, 'fusion': 12, 'memory_access': 24, 'block_pointers': 2, 'persistent_kernel': 6, 'device_specific': 29, 'autotuning': 6}), 35 constraints, 15 examples
+INFO:xe_forge.pipeline:  Knowledge base: 88 patterns ({'algorithmic': 6, 'dtype_fix': 3, 'fusion': 12, 'memory_access': 24, 'block_pointers': 2, 'persistent_kernel': 6, 'device_specific': 29, 'autotuning': 6}), 35 constraints, 15 examples
+INFO:xe_forge.pipeline:XeForgePipeline initialized (LLM-knowledge mode)
+INFO:xe_forge.pipeline:  LLM: gpt-5.5
+INFO:xe_forge.pipeline:  Agent: cover (max_iters=3)
+INFO:xe_forge.pipeline:Loaded spec: variant=bench-gpu, shapes=[(1, 40, 16384, 128), (1, 40, 16384, 128), (1, 40, 16384, 128)], dims={'B': 1, 'A': 40, 'S': 16384, 'D': 128}, flop=5497558138880, dtype=torch.float16
+INFO:xe_forge.pipeline:  Model init args: [128]
+INFO:xe_forge.pipeline:Starting optimization for kernel: Model
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 940220.06 μs
+INFO:xe_forge.pipeline:Original: 5.85 TFLOPS, 940.22 ms
+INFO:xe_forge.core.xpu_query:Attention pattern detected: Q(1, 40, 16384, 128), K(1, 40, 16384, 128), V(1, 40, 16384, 128) -> M=16384, N=16384, K=128
+INFO:xe_forge.core.xpu_query:Using shape-aware XPU params for M=16384, N=16384, K=128
+INFO:xe_forge.core.xpu_query:Got XPU info via torch.xpu: Intel(R) Graphics [0xe223]
+INFO:xe_forge.core.xpu_query:Got XPU info via torch.xpu: Intel(R) Graphics [0xe223]
+INFO:xe_forge.pipeline:============================================================
+STAGE: ANALYSIS
+============================================================
+INFO:xe_forge.agents.analyzer_agent:Analyzer KB context: 6015 chars, 17 constraints
+INFO:xe_forge.agents.analyzer_agent:Parsed 9/9 issues from LLM
+INFO:xe_forge.pipeline:Detected 9 issues:
+INFO:xe_forge.pipeline:  [4] missing_autotune: The Model forward path calls attn_fwd_launch(), which launches _attn_fwd with hardcoded BLOCK_M=128, BLOCK_N=64, num_warps=16, num_stages=3. Although an autotune config list and tuner are defined, they are not used by attn_fwd_launch() or Model.forward(). For the target shape N_CTX=16384, HEAD_DIM=128 on Intel XPU, the optimal BLOCK_N/BLOCK_M/warps can vary significantly.
+INFO:xe_forge.pipeline:  [3] suboptimal_autotune_configs: The existing forward autotune configs only try BLOCK_N in {32,64}. For HEAD_DIM=128 and very long sequence length, BLOCK_N=128 is often an important candidate because it halves the number of K/V loop iterations versus BLOCK_N=64. The current configs may miss better XPU DPA utilization and lower loop overhead.
+INFO:xe_forge.pipeline:  [3] suboptimal_warps: The active forward launch uses num_warps=16. For large attention tiles on Intel Data Center GPU Max, 32 warps is often beneficial, especially with grf_mode='256' and HEAD_DIM=128. The autotune configs include 32 warps, but the Model path never uses them.
+INFO:xe_forge.pipeline:  [3] no_swizzling: For N_CTX > 512 the grid is ordered as (Z, H, num_blocks_m). This tends to schedule different heads before adjacent M-blocks of the same head. Since every Q block for a given head streams the same K/V sequence, scheduling adjacent M blocks of the same head closer together can improve L2 reuse of K/V tiles.
+INFO:xe_forge.pipeline:  [2] unnecessary_materialization: The inference-only Model.forward path returns only O, but attn_fwd_launch() still allocates M and _attn_fwd stores the per-row log-sum-exp values to M. This M tensor is only needed for backward; in the provided Model path it is immediately discarded.
+INFO:xe_forge.pipeline:  [4] unnecessary_materialization: The backward path materializes a full scaled copy of K with arg_k = arg_k * (ctx.sm_scale * RCP_LN2) before launching _attn_bwd. This creates an extra PyTorch elementwise kernel, allocates another K-sized tensor, writes it to HBM, and then _attn_bwd reads it back.
+INFO:xe_forge.pipeline:  [4] non_contiguous_input: The forward kernel constructs tensor descriptors assuming Q/K/V/O are contiguous with flattened strides [HEAD_DIM,1], but attn_fwd_launch() and Model.forward() do not enforce contiguity. Non-contiguous inputs would either produce wrong addressing or very poor memory access behavior.
+INFO:xe_forge.pipeline:  [2] manual_pointer_arithmetic: Several backward/preprocess loads and stores use manual pointer arithmetic for 2D blocks even though other parts of the code already use tensor descriptors. Manual arithmetic is more error-prone and misses automatic boundary handling / descriptor optimizations.
+INFO:xe_forge.pipeline:  [2] missing_boundary_check: The forward and backward kernels generally assume N_CTX is divisible by BLOCK_M/BLOCK_N and HEAD_DIM matches the tile. The target N_CTX=16384,D=128 is divisible, but the wrapper uses cdiv() in forward without masks or descriptor boundary_check, so other sequence lengths would read/write out of bounds.
+INFO:xe_forge.pipeline:============================================================
+STAGE: PLANNING
+============================================================
+INFO:xe_forge.planner:Stage order (agent): ['algorithmic', 'memory_access', 'block_pointers', 'device_specific', 'autotuning']
+INFO:xe_forge.planner:Planner rationale: Algorithmic changes should be applied first because the kernel has materialization issues, especially the backward path materializing a full scaled copy of K and the forward path producing unused intermediate outputs. These structural rewrites may remove or reshape later memory and tuning work.
+
+Nex
+INFO:xe_forge.pipeline:Optimization plan:
+INFO:xe_forge.pipeline:  + algorithmic [#1]: unnecessary_materialization, unnecessary_materialization
+INFO:xe_forge.pipeline:  - discovery: skipped
+INFO:xe_forge.pipeline:  - dtype_fix: skipped
+INFO:xe_forge.pipeline:  - fusion: skipped
+INFO:xe_forge.pipeline:  + memory_access [#2]: non_contiguous_input, missing_boundary_check
+INFO:xe_forge.pipeline:  + block_pointers [#3]: manual_pointer_arithmetic
+INFO:xe_forge.pipeline:  - persistent_kernel: skipped
+INFO:xe_forge.pipeline:  + device_specific [#4]: suboptimal_warps, no_swizzling
+INFO:xe_forge.pipeline:  + autotuning [#5]: missing_autotune, suboptimal_autotune_configs
+INFO:xe_forge.pipeline:============================================================
+STAGE: ALGORITHMIC
+============================================================
+INFO:xe_forge.pipeline:Issues: unnecessary_materialization, unnecessary_materialization
+INFO:xe_forge.agents.optimizer_agent:Applying optimization stage: algorithmic
+INFO:xe_forge.agents.optimizer_agent:KB context for algorithmic: 14027 chars, 19 patterns/constraints
+INFO:xe_forge.agents.optimizer_agent:Measuring: original vs optimized (call #3)
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 939103.12 μs
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 1004489.62 μs
+INFO:xe_forge.agents.optimizer_agent:  original : 939103.12 µs
+INFO:xe_forge.agents.optimizer_agent:  optimized: 1004489.62 µs
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 843712.19 μs
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 1004519.56 μs
+WARNING:xe_forge.agents.optimizer_agent:Stage algorithmic failed: no valid result in budget
+WARNING:xe_forge.pipeline:Stage algorithmic failed: No valid optimization found within iteration budget
+INFO:xe_forge.agents.analyzer_agent:Analyzer KB context: 6015 chars, 17 constraints
+INFO:xe_forge.agents.analyzer_agent:Parsed 9/9 issues from LLM
+INFO:xe_forge.pipeline:============================================================
+STAGE: MEMORY_ACCESS
+============================================================
+INFO:xe_forge.pipeline:Issues: non_contiguous_input, missing_boundary_check
+INFO:xe_forge.agents.optimizer_agent:Applying optimization stage: memory_access
+INFO:xe_forge.agents.optimizer_agent:KB context for memory_access: 14027 chars, 30 patterns/constraints
+INFO:xe_forge.agents.optimizer_agent:Measuring: original vs optimized (call #2)
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 843014.38 μs
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 948662.69 μs
+INFO:xe_forge.agents.optimizer_agent:  original : 843014.38 µs
+INFO:xe_forge.agents.optimizer_agent:  optimized: 948662.69 µs
+INFO:xe_forge.agents.optimizer_agent:Measuring: original vs optimized (call #3)
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 842889.69 μs
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 949071.81 μs
+INFO:xe_forge.agents.optimizer_agent:  original : 842889.69 µs
+INFO:xe_forge.agents.optimizer_agent:  optimized: 949071.81 µs
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 842991.69 μs
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 843188.88 μs
+WARNING:xe_forge.agents.optimizer_agent:Stage memory_access failed: no valid result in budget
+WARNING:xe_forge.pipeline:Stage memory_access failed: No valid optimization found within iteration budget
+INFO:xe_forge.agents.analyzer_agent:Analyzer KB context: 6015 chars, 17 constraints
+INFO:xe_forge.agents.analyzer_agent:Parsed 9/9 issues from LLM
+INFO:xe_forge.pipeline:============================================================
+STAGE: BLOCK_POINTERS
+============================================================
+INFO:xe_forge.pipeline:Issues: manual_pointer_arithmetic
+INFO:xe_forge.agents.optimizer_agent:Applying optimization stage: block_pointers
+INFO:xe_forge.agents.optimizer_agent:KB context for block_pointers: 14027 chars, 15 patterns/constraints
+INFO:xe_forge.agents.optimizer_agent:Measuring: original vs optimized (call #1)
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 843471.69 μs
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 1564485.50 μs
+INFO:xe_forge.agents.optimizer_agent:  original : 843471.69 µs
+INFO:xe_forge.agents.optimizer_agent:  optimized: 1564485.50 µs
+INFO:xe_forge.agents.optimizer_agent:Measuring: original vs optimized (call #3)
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 901389.31 μs
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 892248.31 μs
+INFO:xe_forge.agents.optimizer_agent:  original : 901389.31 µs
+INFO:xe_forge.agents.optimizer_agent:  optimized: 892248.31 µs
+INFO:xe_forge.agents.optimizer_agent:Optimization verified: 1.05x speedup (vs true baseline 940.220ms)
+INFO:xe_forge.agents.optimizer_agent:Stage block_pointers new best: 1.05x
+INFO:xe_forge.agents.optimizer_agent:Stage block_pointers OK — best 1.05x (3 iters used)
+INFO:xe_forge.pipeline:Stage block_pointers OK (1.05x)
+INFO:xe_forge.agents.analyzer_agent:Analyzer KB context: 6015 chars, 17 constraints
+INFO:xe_forge.agents.analyzer_agent:Parsed 8/8 issues from LLM
+INFO:xe_forge.pipeline:============================================================
+STAGE: DEVICE_SPECIFIC
+============================================================
+INFO:xe_forge.pipeline:Issues: suboptimal_warps, no_swizzling
+INFO:xe_forge.agents.optimizer_agent:Applying optimization stage: device_specific
+INFO:xe_forge.agents.optimizer_agent:KB context for device_specific: 14027 chars, 21 patterns/constraints
+INFO:xe_forge.agents.optimizer_agent:Measuring: original vs optimized (call #3)
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 891957.50 μs
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 83716.51 μs
+INFO:xe_forge.agents.optimizer_agent:  original : 891957.50 µs
+INFO:xe_forge.agents.optimizer_agent:  optimized: 83716.51 µs
+INFO:xe_forge.agents.optimizer_agent:Optimization verified: 11.23x speedup (vs true baseline 940.220ms)
+INFO:xe_forge.agents.optimizer_agent:Stage device_specific new best: 11.23x
+INFO:xe_forge.agents.optimizer_agent:Stage device_specific OK — best 11.23x (3 iters used)
+INFO:xe_forge.pipeline:Stage device_specific OK (11.23x)
+INFO:xe_forge.agents.analyzer_agent:Analyzer KB context: 6015 chars, 17 constraints
+INFO:xe_forge.agents.analyzer_agent:Parsed 6/6 issues from LLM
+INFO:xe_forge.pipeline:============================================================
+STAGE: AUTOTUNING
+============================================================
+INFO:xe_forge.pipeline:Issues: missing_autotune, suboptimal_autotune_configs
+INFO:xe_forge.agents.optimizer_agent:Applying optimization stage: autotuning
+INFO:xe_forge.agents.optimizer_agent:KB context for autotuning: 14027 chars, 27 patterns/constraints
+INFO:xe_forge.core.xpu_query:Attention pattern detected: Q(1, 40, 16384, 128), K(1, 40, 16384, 128), V(1, 40, 16384, 128) -> M=16384, N=16384, K=128
+INFO:xe_forge.core.xpu_query:Got XPU info via torch.xpu: Intel(R) Graphics [0xe223]
+INFO:xe_forge.core.xpu_query:Got XPU info via torch.xpu: Intel(R) Graphics [0xe223]
+INFO:xe_forge.core.xpu_query:Attention pattern detected: Q(1, 40, 16384, 128), K(1, 40, 16384, 128), V(1, 40, 16384, 128) -> M=16384, N=16384, K=128
+INFO:xe_forge.agents.optimizer_agent:Measuring: original vs optimized (call #1)
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 83270.20 μs
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 83554.29 μs
+INFO:xe_forge.agents.optimizer_agent:  original : 83270.20 µs
+INFO:xe_forge.agents.optimizer_agent:  optimized: 83554.29 µs
+INFO:xe_forge.agents.optimizer_agent:Optimization verified: 11.25x speedup (vs true baseline 940.220ms)
+WARNING:xe_forge.agents.optimizer_agent:Stage autotuning failed: no valid result in budget
+WARNING:xe_forge.pipeline:Stage autotuning failed: No valid optimization found within iteration budget
+INFO:xe_forge.agents.analyzer_agent:Analyzer KB context: 6015 chars, 17 constraints
+INFO:xe_forge.agents.analyzer_agent:Parsed 4/4 issues from LLM
+INFO:xe_forge.core.executor:Moved model to xpu with dtype torch.float16
+INFO:xe_forge.core.executor:Execution time: 83830.06 μs
+INFO:xe_forge.pipeline:Total speedup: 11.22x
+INFO:xe_forge.pipeline:============================================================
+OPTIMIZATION COMPLETE
+============================================================
+INFO:xe_forge.pipeline:Stages: 2/5 succeeded
+INFO:xe_forge.pipeline:Failed: ['algorithmic', 'memory_access', 'autotuning']
+INFO:xe_forge.pipeline:Speedup: 11.22x
+Traceback (most recent call last):
+  File "/home/gta/smarcink/Xe-Forge/.venv/bin/xe-forge", line 10, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "/home/gta/smarcink/Xe-Forge/src/xe_forge/cli.py", line 290, in main
+    return _run_optimize(parser, args, config)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/gta/smarcink/Xe-Forge/src/xe_forge/cli.py", line 560, in _run_optimize
+    with open(args.output, "w") as f:
+         ^^^^^^^^^^^^^^^^^^^^^^
+FileNotFoundError: [Errno 2] No such file or directory: '/examples/attention/dump/v0/optimized_kernel.py'

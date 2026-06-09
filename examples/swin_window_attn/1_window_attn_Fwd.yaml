@@ -1,0 +1,43 @@
+# Swin Transformer window-attention block (forward).
+#
+# Model.__init__(dim, num_heads, window_size, shift_size, mlp_ratio):
+#   dim=C=32, num_heads=1, window_size=4, shift_size=0, mlp_ratio=4
+# All ctor args are scalars, so they are passed via the `inits:` section below.
+# `dim` resolves from the `C` dim; the rest are integer literals.
+#
+# Single input X with NHWC layout. H and W must be divisible by the window (4)
+# and C must equal `dim` (32).
+inputs:
+  X:
+    shape: [B, H, W, C]
+    dtype: float16
+
+inits:
+  - dim: C            # head/embed dim -> resolves to C (32)
+  - num_heads: 1      # literal
+  - window_size: 4    # literal
+  - shift_size: 0     # literal
+  - mlp_ratio: 4      # literal
+
+ci:
+  - params: [X]
+    dtype: float16
+    dims:
+      # Small CI shape: fast correctness sanity (H, W divisible by 4)
+      B: 1
+      H: 64
+      W: 64
+      C: 32
+    # per token: 8*C*C (qkv+proj) + 4*N*C (attn, N=16) + 4*C*HIDDEN (mlp, HIDDEN=4*C)
+    #          = 8*C*C + 64*C + 16*C*C = 24*C*C + 64*C
+    flop: "B*H*W*(24*C*C + 64*C)"
+
+bench-gpu:
+  - params: [X]
+    dtype: float16
+    dims:
+      B: 1
+      H: 720
+      W: 1280
+      C: 32
+    flop: "B*H*W*(24*C*C + 64*C)"

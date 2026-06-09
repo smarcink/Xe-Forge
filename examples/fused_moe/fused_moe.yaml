@@ -1,0 +1,75 @@
+# Mixture-of-Experts (MoE) feed-forward block — fused Triton implementation (forward).
+#
+# Model.__init__(dim, intermediate_size, num_experts, top_k):
+#   dim               = hidden size            -> resolves to the input's D dim
+#   intermediate_size = per-expert FFN width   -> resolves to the I dim
+#   num_experts       = number of experts      -> resolves to the E dim
+#   top_k             = experts routed/token   -> resolves to the K dim
+# Ctor args are passed positionally via the `inits:` section (order must match the
+# constructor signature). `dim` must equal the input hidden size, so it is tied to
+# the same `D` used by the input shape.
+#
+# Single input `hidden_states` with shape [B, S, D] (batch, sequence, hidden).
+# The Model calls .half(), so all weights are fp16 and the input must be fp16 too.
+#
+# FLOPs: three expert GEMMs (gate w1, up w3, down w2) over M = B*S*top_k routed
+# tokens -> 6*B*S*K*D*I, plus the router/gate projection 2*B*S*D*E. (I, E and K are
+# carried as extra dims so they are available to both `inits` and the flop formula.)
+inputs:
+  hidden_states:
+    shape: [B, S, D]
+    dtype: float16
+
+inits:
+  - dim: D                # hidden size -> input D
+  - intermediate_size: I  # per-expert FFN width
+  - num_experts: E        # number of experts
+  - top_k: K              # experts routed per token
+
+ci:
+  # Small shape for fast correctness checks (fp16 atomic scatter is noisy).
+  # Same default architecture (D=1024, I=2816, E=8, K=2), just a tiny B/S.
+  - params: [hidden_states]
+    dtype: float16
+    dims:
+      B: 1
+      S: 128
+      D: 1024
+      I: 2816
+      E: 8
+      K: 2
+    flop: "6*B*S*K*D*I + 2*B*S*D*E"
+    rtol: 0.01
+    atol: 0.01
+
+bench-gpu:
+  # Mirrors the original get_inputs / get_init_inputs setup:
+  #   get_inputs:      B=2, S=512, D=1024
+  #   get_init_inputs: [] -> Model defaults (dim=1024, intermediate=2816, num_experts=8, top_k=2)
+  - params: [hidden_states]
+    dtype: float16
+    dims:
+      B: 2
+      S: 512
+      D: 1024
+      I: 2816
+      E: 8
+      K: 2
+    flop: "6*B*S*K*D*I + 2*B*S*D*E"
+    rtol: 0.01
+    atol: 0.01
+
+bench-gpu-1:
+  # Larger throughput shape, same default architecture (more tokens to optimize against).
+  - params: [hidden_states]
+    dtype: float16
+    dims:
+      B: 4
+      S: 2048
+      D: 1024
+      I: 2816
+      E: 8
+      K: 2
+    flop: "6*B*S*K*D*I + 2*B*S*D*E"
+    rtol: 0.01
+    atol: 0.01
