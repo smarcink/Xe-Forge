@@ -1,8 +1,10 @@
 """Tests for spec_loader variant resolution and parsing."""
 
+import pytest
 import torch
 
-from xe_forge.core.spec_loader import load_spec_from_string
+from xe_forge.core.spec_loader import load_spec, load_spec_from_string
+from xe_forge.utils.path_resolution import resolve_linked_path
 
 BASIC_SPEC = """\
 inputs:
@@ -228,3 +230,41 @@ class TestLoadFromFile:
         assert variant is not None
         assert variant.dims["M"] == 1024
         assert variant.dims["N"] == 2048
+
+    def test_loads_git_symlink_placeholder_spec(self, tmp_path):
+        examples_dir = tmp_path / "examples"
+        kernels_dir = tmp_path / "test_kernels"
+        examples_dir.mkdir()
+        kernels_dir.mkdir()
+
+        target = kernels_dir / "spec.yaml"
+        target.write_text(BASIC_SPEC, encoding="utf-8")
+
+        placeholder = examples_dir / "spec.yaml"
+        placeholder.write_text("../test_kernels/spec.yaml\n", encoding="utf-8")
+
+        spec = load_spec(placeholder)
+
+        assert spec.get_input_shapes("ci") == [(4, 8)]
+
+
+class TestLinkedPathResolution:
+    def test_resolves_git_symlink_placeholder_file(self, tmp_path):
+        examples_dir = tmp_path / "examples"
+        kernels_dir = tmp_path / "test_kernels"
+        examples_dir.mkdir()
+        kernels_dir.mkdir()
+
+        target = kernels_dir / "kernel.py"
+        target.write_text("print('ok')\n", encoding="utf-8")
+
+        placeholder = examples_dir / "kernel.py"
+        placeholder.write_text("../test_kernels/kernel.py\n", encoding="utf-8")
+
+        assert resolve_linked_path(placeholder) == target.resolve()
+
+
+class TestInvalidSpecInput:
+    def test_non_mapping_spec_raises_clear_error(self):
+        with pytest.raises(ValueError, match="YAML mapping"):
+            load_spec_from_string("just-a-string")

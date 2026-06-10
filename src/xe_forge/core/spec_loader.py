@@ -25,6 +25,7 @@ from ai_bench.harness.core import (
 from ai_bench.utils import eval_eq
 
 from xe_forge.core.dtype_utils import make_rand_tensor
+from xe_forge.utils.path_resolution import read_linked_text
 
 V_BENCH_XPU = "bench-xpu"
 
@@ -345,8 +346,7 @@ class KernelSpec:
 
 def load_spec(path: str | Path) -> KernelSpec:
     """Load kernel spec from YAML file."""
-    with open(path) as f:
-        data = yaml.safe_load(f)
+    data = yaml.safe_load(read_linked_text(path))
     return parse_spec(data)
 
 
@@ -376,6 +376,13 @@ def parse_spec(data: dict) -> KernelSpec:
     All keys are stored in _named_variants so _variants() can look them up by
     their exact name.
     """
+    if not isinstance(data, dict):
+        raise ValueError(
+            "Kernel spec must decode to a YAML mapping. If you loaded a file from "
+            "examples/ on Windows, Git may have checked out a symlink as a plain "
+            "text path; use the matching file in test_kernels/ or enable symlink support."
+        )
+
     inputs: dict[str, InputSpec] = {}
     if SpecKey.INS in data:
         for name, input_data in data[SpecKey.INS].items():

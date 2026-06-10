@@ -17,6 +17,7 @@ from pathlib import Path
 
 from xe_forge.config import Config, get_config, override_config
 from xe_forge.models import OptimizationStage
+from xe_forge.utils.path_resolution import resolve_linked_path
 
 logger = logging.getLogger(__name__)
 
@@ -513,19 +514,17 @@ def _run_optimize(parser, args, config: Config) -> int:
         print(f"Executor: KernelBenchExecutor (device={config.device_config.device})")
 
     # Read input file
-    with open(args.input) as f:
-        kernel_code = f.read()
+    resolved_input_path = resolve_linked_path(args.input)
+    kernel_code = resolved_input_path.read_text(encoding="utf-8")
 
     # Read reference implementation (Python DSLs only)
     reference_code = ""
     if dsl not in ("sycl", "cuda"):
+        reference_path = resolved_input_path.with_name(f"{resolved_input_path.stem}_pytorch.py")
         try:
-            with open(f"{os.path.splitext(args.input)[0]}_pytorch.py") as f:
-                reference_code = f.read()
+            reference_code = reference_path.read_text(encoding="utf-8")
         except FileNotFoundError:
-            print(
-                f"No PyTorch reference file found at {os.path.splitext(args.input)[0]}_pytorch.py"
-            )
+            print(f"No PyTorch reference file found at {reference_path}")
 
     # Create engine and optimize
     from xe_forge.engines import create_engine
@@ -557,7 +556,9 @@ def _run_optimize(parser, args, config: Config) -> int:
 
     # Save output if requested
     if args.output and result.optimized_code:
-        with open(args.output, "w") as f:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w") as f:
             f.write(result.optimized_code)
 
     # Print results
