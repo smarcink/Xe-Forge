@@ -1,0 +1,36 @@
+# Fused RMSNorm + RoPE block (forward).
+#
+# Model.__init__(dim, num_heads, seq_len, eps):
+#   dim=4096, num_heads=32, seq_len=2048, eps=1e-6  (all constructor defaults)
+# get_init_inputs() returns [], so the model is built with no ctor args and the
+# defaults above are used -> no `inits:` section is required.
+#
+# Single input X with [B, S, D] layout (batch, sequence, hidden).
+#   D must equal `dim` (4096) and be divisible by num_heads (32 -> head_dim=128).
+#   S must be <= seq_len (2048) so the precomputed RoPE cos/sin table covers it.
+inputs:
+  X:
+    shape: [B, S, D]
+    dtype: float16
+
+ci:
+  - params: [X]
+    dtype: float16
+    dims:
+      # Small CI shape: fast correctness sanity.
+      # D stays 4096 (== ctor `dim`); S <= 2048 (== ctor `seq_len`).
+      B: 1
+      S: 512
+      D: 4096
+    # Per row (B*S rows of length D): RMSNorm sum-of-squares (~2D) + scale (2D)
+    # + partner re-normalize (2D) + RoPE rotate (3D) ~= 9D.
+    flop: "9*B*S*D"
+
+bench-gpu:
+  - params: [X]
+    dtype: float16
+    dims:
+      B: 8
+      S: 2048
+      D: 4096
+    flop: "9*B*S*D"

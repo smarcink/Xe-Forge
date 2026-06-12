@@ -1,0 +1,37 @@
+# Mamba SSM block (forward).
+#
+# Model.__init__(d_model, d_state, d_conv):
+#   d_model=1024, d_state=16, d_conv=4  (all constructor defaults)
+# get_init_inputs() returns [], so the model is built with no ctor args and the
+# defaults above are used -> no `inits:` section is required.
+#
+# Single input X with [B, S, D] layout (batch, sequence, hidden).
+#   D must equal `d_model` (1024): the SSM scan kernel hardcodes d_state=16 and
+#   dt_rank=D//16, and the GEMM kernels assume D / dt_rank are multiples of 64.
+inputs:
+  X:
+    shape: [B, S, D]
+    dtype: float16
+
+ci:
+  - params: [X]
+    dtype: float16
+    dims:
+      # Small CI shape: fast correctness sanity.
+      # D stays 1024 (== ctor `d_model`); B*S kept divisible by 64.
+      B: 1
+      S: 256
+      D: 1024
+    # conv1d(k=4): 2*4*D ; x_proj GEMM: 2*D*P (P=dt_rank+2*d_state) ;
+    # dt_proj GEMM: 2*dt_rank*D ; SSM scan: ~6*d_state*D.
+    # dt_rank = D/16, d_state = 16 (D is required to be 1024).
+    flop: "B*S*(2*4*D + 2*D*(D/16 + 2*16) + 2*(D/16)*D + 6*16*D)"
+
+bench-gpu:
+  - params: [X]
+    dtype: float16
+    dims:
+      B: 4
+      S: 2048
+      D: 1024
+    flop: "B*S*(2*4*D + 2*D*(D/16 + 2*16) + 2*(D/16)*D + 6*16*D)"

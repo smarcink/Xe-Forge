@@ -1,0 +1,47 @@
+# ConvBlock: Conv2d(3x3, same padding) -> ReLU -> AvgPool2d(2) (forward).
+#
+# Model.__init__(in_channels, out_channels, kernel_size, stride=1, bias=True,
+#                activation_type=RELU, signed_quant=True, quantize_conv=False,
+#                quantize_act=False, activation_quantizer=None,
+#                integer_forward=False, num_bits_conv=8, num_bits_act=8,
+#                padding_mode="zeros")
+# Only the three required ctor args are passed via `inits:`; every other
+# argument from get_init_inputs (stride=1, bias=True, RELU, no-quant, fp
+# forward, "zeros") already matches the constructor defaults.
+#
+# Single input X with NCHW layout. `in_channels` resolves from Cin and must
+# equal the C dimension; `out_channels` resolves from Cout. H and W must be
+# even (AvgPool2d kernel=2 halves both).
+inputs:
+  X:
+    shape: [N, Cin, H, W]
+    dtype: float16
+
+inits:
+  - in_channels: Cin      # -> resolves to Cin (16)
+  - out_channels: Cout    # -> resolves to Cout (32)
+  - kernel_size: 3        # literal (3x3 conv)
+
+ci:
+  - params: [X]
+    dtype: float16
+    dims:
+      # Small CI shape: fast correctness sanity (H, W even)
+      N: 1
+      Cin: 16
+      H: 64
+      W: 64
+      Cout: 32
+    # Conv (same pad, stride 1): H*W*Cout outputs, each Cin*9 MACs (2 flop/MAC).
+    flop: "N*Cout*H*W*2*Cin*9"
+
+bench-gpu:
+  - params: [X]
+    dtype: float16
+    dims:
+      N: 1
+      Cin: 16
+      H: 720
+      W: 1280
+      Cout: 32
+    flop: "N*Cout*H*W*2*Cin*9"

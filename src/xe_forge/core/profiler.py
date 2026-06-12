@@ -185,7 +185,9 @@ class XPUProfiler:
         """Run VTune collection and parse the results."""
         with tempfile.TemporaryDirectory(prefix="xeforge_vtune_") as tmpdir:
             result_dir = Path(tmpdir) / "vtune_result"
-            runner_script = self._generate_runner_script(kernel_file, warmup, iters, result_dir)
+            runner_script = self._generate_runner_script(
+                kernel_file, spec_path, variant, warmup, iters, result_dir
+            )
             runner_path = Path(tmpdir) / "runner.py"
             runner_path.write_text(runner_script)
 
@@ -230,24 +232,50 @@ class XPUProfiler:
     def _generate_runner_script(
         self,
         kernel_file: Path,
+        spec_path: str | Path | None,
+        variant: str,
         warmup: int,
         iters: int,
         result_dir: Path,
     ) -> str:
+        kernel_file_lit = repr(str(kernel_file))
+        spec_path_lit = repr(str(spec_path)) if spec_path is not None else "None"
+        variant_lit = repr(variant)
+        vtune_bin_lit = repr(self.vtune_bin)
+        result_dir_lit = repr(str(result_dir))
         return f"""\
 import importlib.util, sys, torch, subprocess
 
-spec = importlib.util.spec_from_file_location("kernel_mod", "{kernel_file}")
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
+_mod_spec = importlib.util.spec_from_file_location("kernel_mod", {kernel_file_lit})
+mod = importlib.util.module_from_spec(_mod_spec)
+_mod_spec.loader.exec_module(mod)
 
 Model = mod.Model
-get_inputs = mod.get_inputs
-get_init_inputs = mod.get_init_inputs
-
 device = "xpu" if hasattr(torch, "xpu") and torch.xpu.is_available() else "cuda"
-model = Model(*get_init_inputs()).to(device).eval()
-inputs = [x.to(device) if isinstance(x, torch.Tensor) else x for x in get_inputs()]
+
+_spec_path = {spec_path_lit}
+_variant = {variant_lit}
+
+
+def _build_init_and_inputs():
+    # KernelBench-style modules expose get_inputs/get_init_inputs directly.
+    if hasattr(mod, "get_inputs") and hasattr(mod, "get_init_inputs"):
+        return mod.get_init_inputs(), mod.get_inputs()
+    # Spec-driven kernels build inputs from the YAML spec instead.
+    if _spec_path:
+        from xe_forge.core.spec_loader import load_spec
+
+        spec = load_spec(_spec_path)
+        v = spec.resolve_variant(_variant)
+        return spec.get_init_args(v), spec.create_inputs(v, device=device)
+    raise RuntimeError(
+        "Kernel module exposes no get_inputs/get_init_inputs and no --spec was given."
+    )
+
+
+init_args, inputs = _build_init_and_inputs()
+model = Model(*init_args).to(device).eval()
+inputs = [x.to(device) if isinstance(x, torch.Tensor) else x for x in inputs]
 
 _sync = torch.xpu.synchronize if device == "xpu" else torch.cuda.synchronize
 
@@ -258,8 +286,8 @@ with torch.no_grad():
         _sync()
 
 # Resume VTune
-vtune_bin = "{self.vtune_bin}"
-result_dir = "{result_dir}"
+vtune_bin = {vtune_bin_lit}
+result_dir = {result_dir_lit}
 subprocess.run([vtune_bin, "-command", "resume", "-r", result_dir],
                capture_output=True, timeout=30)
 
