@@ -38,6 +38,8 @@ class KernelValidator:
             return self._validate_triton(code, stage)
         if dsl == "sycl":
             return self._validate_sycl(code)
+        if dsl == "cm":
+            return self._validate_cm(code)
         return self._validate_generic(code)
 
     # ------------------------------------------------------------------
@@ -407,6 +409,44 @@ class KernelValidator:
                     "missing_include",
                     "warning",
                     "No #include directives found in SYCL source.",
+                )
+            )
+
+        return issues
+
+    # ------------------------------------------------------------------
+    # CM ("C for Metal") validation
+    # ------------------------------------------------------------------
+
+    def _validate_cm(self, code: str) -> list[ValidationIssue]:
+        issues: list[ValidationIssue] = []
+
+        if "#include" not in code:
+            issues.append(
+                ValidationIssue(
+                    "missing_include",
+                    "warning",
+                    "No #include directives found in CM source.",
+                )
+            )
+
+        if "cm/cm.h" not in code and "cm.h" not in code:
+            issues.append(
+                ValidationIssue(
+                    "missing_cm_header",
+                    "info",
+                    "CM kernels usually include <cm/cm.h>.",
+                    suggestion="Add #include <cm/cm.h>.",
+                )
+            )
+
+        if "_GENX_MAIN_" not in code:
+            issues.append(
+                ValidationIssue(
+                    "missing_genx_main",
+                    "warning",
+                    "No _GENX_MAIN_ kernel entry point found in CM source.",
+                    suggestion="Mark the kernel entry with extern \"C\" _GENX_MAIN_ void ...",
                 )
             )
 

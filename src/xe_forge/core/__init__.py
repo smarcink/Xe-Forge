@@ -50,6 +50,10 @@ from xe_forge.core.sycl_executor import (
     SyclComparisonResult,
     SyclExecutor,
 )
+from xe_forge.core.cm_executor import (
+    CMComparisonResult,
+    CMExecutor,
+)
 from xe_forge.core.trial_manager import TrialManager
 from xe_forge.core.validator import (
     KernelValidator,
@@ -73,6 +77,8 @@ from xe_forge.core.xpu_query import (
 __all__ = [
     "AnalysisResult",
     "CUDADeviceInfo",
+    "CMComparisonResult",
+    "CMExecutor",
     "ComparisonResult",
     "DeviceInfo",
     "InputSpec",
@@ -118,14 +124,20 @@ __all__ = [
 def create_executor_from_config(
     config,
     kernel_type: KernelType | str = KernelType.GEMM,
-) -> KernelBenchExecutor | SyclExecutor:
+) -> KernelBenchExecutor | SyclExecutor | CMExecutor:
     """
     Create an executor with settings from Config.
 
-    Returns SyclExecutor when dsl=sycl, KernelBenchExecutor otherwise.
+    Returns CMExecutor when dsl=cm, SyclExecutor when dsl=sycl, otherwise
+    KernelBenchExecutor.
     """
     from xe_forge.models import DSL
 
+    if config.device_config.dsl == DSL.CM:
+        return CMExecutor(
+            verify=config.optimization.require_correctness,
+            kernel_type=kernel_type,
+        )
     if config.device_config.dsl == DSL.SYCL:
         return SyclExecutor(
             verify=config.optimization.require_correctness,

@@ -71,6 +71,46 @@ def _verify_sycl(code, original_code, executor, input_shapes, spec_dims=None):
     return SUCCESS_MESSAGE
 
 
+def _verify_cm(code, original_code, executor, input_shapes, spec_dims=None, input_dtypes=None):
+    """Verify a CM C++ kernel: basic structure check + runtime comparison."""
+    if "#include" not in code:
+        return "MISSING: C++ code must contain #include directives."
+    if "_GENX_" not in code and "cm_" not in code:
+        return "MISSING: Code does not appear to be a CM kernel (no _GENX_/cm_*)."
+
+    if executor:
+        try:
+            _dims = spec_dims or dict(
+                zip(("M", "N", "K"), _extract_gemm_dims(input_shapes), strict=False)
+            )
+            comparison = executor.compare_kernels(
+                original_code=original_code,
+                optimized_code=code,
+                dims=_dims,
+                input_shapes=input_shapes,
+                input_dtypes=input_dtypes,
+            )
+            if not comparison.optimized_correct:
+                return comparison.feedback_message or "Optimized kernel failed."
+            if comparison.is_slower:
+                sd = 1.0 / comparison.speedup if comparison.speedup > 0 else float("inf")
+                return (
+                    f"PERFORMANCE REGRESSION: {sd:.2f}x SLOWER.\n"
+                    f"Original: {comparison.original_time_ms:.4f}ms ({comparison.original_tflops or 0:.3f} TFlop/s)\n"
+                    f"Optimized: {comparison.optimized_time_ms:.4f}ms ({comparison.optimized_tflops or 0:.3f} TFlop/s)"
+                )
+            logger.info(
+                f"CM optimization verified: {comparison.speedup:.2f}x speedup "
+                f"({comparison.original_tflops or 0:.3f} -> {comparison.optimized_tflops or 0:.3f} TFlop/s)"
+            )
+            return SUCCESS_MESSAGE
+        except Exception as e:
+            return f"RUNTIME ERROR: {e!s}"
+
+    logger.warning("No executor - accepting CM code based on static checks only")
+    return SUCCESS_MESSAGE
+
+
 SUCCESS_MESSAGE = "Success! Optimization verified and kernel is faster."
 
 
@@ -363,6 +403,134 @@ class SyclAlgorithmicOptimizationSignature(dspy.Signature):
     )
 
 
+class CMOptimizationSignature(dspy.Signature):
+    """Optimize a CM ("C for Metal") C++ kernel for Intel GPUs.
+
+    You are an expert in CM (C for Metal), Intel Xe GPU architecture
+    (EU/Xe-core, GRF registers, SLM, the DPAS systolic array), and
+    high-performance low-level kernel optimization.
+
+    Optimize the kernel for maximum performance while producing numerically
+    equivalent outputs. You may change SIMD width, register tiling, memory
+    access patterns, SLM usage, and DPAS configuration.
+
+    === CM OPTIMIZATION KNOBS ===
+    - SIMD width: chosen per-instruction by the compiler and driven by operand
+      width — widen vector<>/matrix<> operands to get wider SIMD; there is no
+      lane-count #define. DPAS runs at a fixed execution size.
+    - DPAS systolic matmul: cm_dpas<Src1Prec, Src2Prec, 8, RepeatCount>(Acc, B, A)
+      with SystolicDepth fixed at 8. bf16/half (CM_PRECISION_BF/HF) -> float
+      accumulate; int8 (CM_PRECISION_S8/U8) -> int32 accumulate.
+    - Register tiles: vector<T,N> / matrix<T,R,C> sized to the GRF budget
+    - SLM staging: cm_slm_init + cm_slm_alloc, move tiles with LSC SLM ops
+      (cm_store_slm / cm_load_slm), sync with cm_slm_fence + cm_barrier
+    - LSC block loads: cm_load<T,NElts,...>(surf, byte_offset) (1D) or a
+      lsc::block_2d_desc with cm_load LoadOp::Normal/Transpose/VNNI (2D) for
+      coalesced HBM access; VNNI-transform lays out the DPAS B matrix
+    - Thread space: cm_group_id, cm_local_id, cm_linear_global_id partitioning
+    - Loop unrolling: #pragma unroll on the K loop
+    - Prefetch: cm_prefetch to hide HBM latency
+    - Data types: bf16/half inputs with float accumulate, or int8 (S8/U8) with
+      int32 accumulate; avoid double
+
+    === STAGE-SPECIFIC GUIDANCE ===
+    ALGORITHMIC: mathematical simplifications, CSE, loop-invariant hoisting,
+      exploit matrix structure (symmetric, triangular, low-rank).
+    DTYPE_FIX: use bf16/half inputs with float accumulators (or int8 S8/U8 with
+      int32 accumulators); avoid double.
+    FUSION: fuse elementwise post-ops (bias, activation, scale, clamp) into the
+      producing kernel before the store — applies to ANY kernel, not just GEMM.
+    MEMORY_ACCESS: use LSC 1D/2D block loads, stage reused tiles through SLM,
+      add cm_prefetch.
+    DEVICE_SPECIFIC: map matmul/conv inner loops onto DPAS (SystolicDepth=8),
+      widen operands so the compiler emits wider SIMD, and size the per-thread
+      tile to the GRF/EU budget of the target Xe device.
+    DISCOVERY: apply the open-ended optimization described in the issues field.
+
+    === CODE REQUIREMENTS ===
+    - Must be complete, valid CM C++ with all required #include directives
+      (e.g. <cm/cm.h> or <cm/cmtl.h>)
+    - Must keep the extern "C" _GENX_MAIN_ kernel entry point and its signature
+    - Must compile with the cmc compiler
+    - Keep the same output format/contract as the original kernel
+    """
+
+    original_code: str = dspy.InputField(desc="Original CM C++ kernel for reference")
+    current_code: str = dspy.InputField(desc="Current CM C++ kernel code to optimize")
+    stage: str = dspy.InputField(desc="Optimization stage to apply")
+    issues: str = dspy.InputField(desc="Specific issues to fix in this stage")
+    xpu_config: str = dspy.InputField(desc="Intel GPU configuration parameters")
+    problem_context: str = dspy.InputField(
+        desc="Problem context: input tensor shapes, dtype, FLOP count, and arithmetic "
+        "intensity. Any kernel type, not just GEMM. Use this to size register/SLM tiles, "
+        "understand memory footprint, and reason about whether the kernel is "
+        "compute-bound or memory-bound."
+    )
+    performance_context: str = dspy.InputField(
+        desc="Current execution performance: baseline time, current time after previous "
+        "stages, and speedup so far. Use this to gauge how much headroom remains and "
+        "whether the kernel is close to hardware peak. Empty if not yet measured."
+    )
+    vtune_report: str = dspy.InputField(
+        desc="VTune profiling report. Empty string if not available. "
+        "Use hotspot and memory-access data to guide which optimizations matter most."
+    )
+    knowledge_base_context: str = dspy.InputField(
+        desc="Relevant optimization patterns and constraints from the knowledge base. "
+        "Empty if KB disabled. Follow the patterns and constraints precisely — "
+        "they are validated optimizations for Intel Xe GPUs."
+    )
+    optimized_code: dspy.Code["cpp"] = dspy.OutputField(
+        desc="Complete optimized CM C++ kernel. Must include all #includes and the _GENX_MAIN_ entry point."
+    )
+
+
+class CMAlgorithmicOptimizationSignature(dspy.Signature):
+    """Apply algorithmic / mathematical optimization to a CM ("C for Metal") C++ kernel.
+
+    You are an expert in numerical linear algebra, compiler optimizations, and
+    high-performance low-level GPU kernel design for Intel Xe GPUs.
+
+    Transform the kernel to perform FEWER FLOPs and/or FEWER memory accesses
+    while producing numerically equivalent results.
+
+    Think about:
+    1. Matrix structure exploitation (symmetric, triangular, diagonal, low-rank)
+    2. Associative / distributive law rewrites to reduce FLOPs
+    3. Common sub-expression elimination and loop-invariant hoisting
+    4. Memory access / layout optimization (coalesced LSC 2D block reads, SLM reuse)
+    5. Batch dimension exploitation
+
+    === CODE REQUIREMENTS ===
+    - Must be complete, valid CM C++ with all required #include directives
+      (e.g. <cm/cm.h> or <cm/cmtl.h>)
+    - Must keep the extern "C" _GENX_MAIN_ kernel entry point and its signature
+    - Must compile with the cmc compiler
+    """
+
+    original_code: str = dspy.InputField(desc="Original CM C++ kernel for reference")
+    current_code: str = dspy.InputField(desc="Current CM C++ kernel to optimize")
+    pytorch_code: str = dspy.InputField(desc="Reference description. May be empty.")
+    issues: str = dspy.InputField(desc="Specific algorithmic issues identified")
+    xpu_config: str = dspy.InputField(desc="Intel GPU configuration parameters")
+    problem_context: str = dspy.InputField(
+        desc="Problem context: input tensor shapes, dtype, FLOP count, and arithmetic intensity. "
+        "Any kernel type, not just GEMM. Use this to understand problem scale, memory "
+        "footprint, and compute intensity."
+    )
+    performance_context: str = dspy.InputField(
+        desc="Current execution performance: baseline time and speedup so far. "
+        "Empty if not yet measured."
+    )
+    knowledge_base_context: str = dspy.InputField(
+        desc="Relevant algorithmic patterns and examples from the knowledge base. "
+        "Empty if KB disabled. Follow these patterns precisely."
+    )
+    optimized_code: dspy.Code["cpp"] = dspy.OutputField(
+        desc="Complete optimized CM C++ kernel with algorithmic improvements."
+    )
+
+
 def _build_performance_context(perf_context: dict | None) -> str:
     """Format perf_context dict into a human-readable string for the LLM prompt."""
     if not perf_context:
@@ -476,18 +644,32 @@ class OptimizerAgent(Optimizer):
                 optimized_code.code if hasattr(optimized_code, "code") else str(optimized_code)
             )
 
-            if dsl == DSL.SYCL:
-                result = _verify_sycl(code, original_code, executor, input_shapes, spec_dims)
+            if dsl in (DSL.SYCL, DSL.CM):
+                if dsl == DSL.CM:
+                    result = _verify_cm(
+                        code, original_code, executor, input_shapes, spec_dims, input_dtypes
+                    )
+                else:
+                    result = _verify_sycl(code, original_code, executor, input_shapes, spec_dims)
                 if result == SUCCESS_MESSAGE and executor:
                     _dims = spec_dims or dict(
                         zip(("M", "N", "K"), _extract_gemm_dims(input_shapes), strict=False)
                     )
                     try:
-                        c = executor.compare_kernels(
-                            original_code=original_code,
-                            optimized_code=code,
-                            dims=_dims,
-                        )
+                        if dsl == DSL.CM:
+                            c = executor.compare_kernels(
+                                original_code=original_code,
+                                optimized_code=code,
+                                dims=_dims,
+                                input_shapes=input_shapes,
+                                input_dtypes=input_dtypes,
+                            )
+                        else:
+                            c = executor.compare_kernels(
+                                original_code=original_code,
+                                optimized_code=code,
+                                dims=_dims,
+                            )
                         last_accepted["comparison"] = c
                     except Exception:
                         pass
@@ -719,9 +901,13 @@ class OptimizerAgent(Optimizer):
         else:
             logger.debug("No KB context for stage %s (KB disabled or empty)", stage.value)
 
-        if self.dsl == DSL.SYCL:
+        if self.dsl in (DSL.SYCL, DSL.CM):
             if stage == OptimizationStage.ALGORITHMIC:
-                sig = SyclAlgorithmicOptimizationSignature
+                sig = (
+                    CMAlgorithmicOptimizationSignature
+                    if self.dsl == DSL.CM
+                    else SyclAlgorithmicOptimizationSignature
+                )
                 kwargs = {
                     "original_code": original_code,
                     "current_code": code,
@@ -733,7 +919,11 @@ class OptimizerAgent(Optimizer):
                     "knowledge_base_context": kb_context,
                 }
             else:
-                sig = SyclOptimizationSignature
+                sig = (
+                    CMOptimizationSignature
+                    if self.dsl == DSL.CM
+                    else SyclOptimizationSignature
+                )
                 kwargs = {
                     "original_code": original_code,
                     "current_code": code,
@@ -835,6 +1025,7 @@ class OptimizerAgent(Optimizer):
                     cached_comparison=last_accepted["comparison"],
                     baseline_ms=_baseline_ms,
                     spec_dims=spec_dims,
+                    input_dtypes=input_dtypes,
                 )
 
                 # Record this attempt for feedback to the next run
@@ -1190,19 +1381,31 @@ class OptimizerAgent(Optimizer):
         cached_comparison=None,
         baseline_ms: float | None = None,
         spec_dims=None,
+        input_dtypes=None,
     ):
-        if self.dsl == DSL.SYCL:
+        if self.dsl in (DSL.SYCL, DSL.CM):
             if "#include" not in opt:
-                return False, None, None, None, "Not valid SYCL C++"
+                return False, None, None, None, "Not valid C++"
         else:
             if not self._valid_py(opt):
                 return False, None, None, None, "Invalid Python syntax"
             if not self._valid_triton(opt):
                 return False, None, None, None, "Not valid Triton"
-        if self.executor and (self.dsl == DSL.SYCL or shapes):
+        if self.executor and (self.dsl in (DSL.SYCL, DSL.CM) or shapes):
             try:
                 if cached_comparison is not None:
                     c = cached_comparison
+                elif self.dsl == DSL.CM:
+                    _dims = spec_dims or dict(
+                        zip(("M", "N", "K"), _extract_gemm_dims(shapes), strict=False)
+                    )
+                    c = self.executor.compare_kernels(
+                        original_code=orig,
+                        optimized_code=opt,
+                        dims=_dims,
+                        input_shapes=shapes,
+                        input_dtypes=input_dtypes,
+                    )
                 elif self.dsl == DSL.SYCL:
                     _dims = spec_dims or dict(
                         zip(("M", "N", "K"), _extract_gemm_dims(shapes), strict=False)

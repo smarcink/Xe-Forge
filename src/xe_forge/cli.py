@@ -500,9 +500,9 @@ def _run_optimize(parser, args, config: Config) -> int:
             print(f"  Spec tolerances: rtol={spec_rtol}, atol={spec_atol}")
         print()
 
-    # Create executor if spec provided (let pipeline auto-create for SYCL/CUDA)
+    # Create executor if spec provided (let pipeline auto-create for SYCL/CUDA/CM)
     executor = None
-    if args.spec and dsl not in ("sycl", "cuda"):
+    if args.spec and dsl not in ("sycl", "cuda", "cm"):
         from xe_forge.core import KernelBenchExecutor
 
         executor = KernelBenchExecutor(
@@ -519,7 +519,7 @@ def _run_optimize(parser, args, config: Config) -> int:
 
     # Read reference implementation (Python DSLs only)
     reference_code = ""
-    if dsl not in ("sycl", "cuda"):
+    if dsl not in ("sycl", "cuda", "cm"):
         reference_path = resolved_input_path.with_name(f"{resolved_input_path.stem}_pytorch.py")
         try:
             reference_code = reference_path.read_text(encoding="utf-8")

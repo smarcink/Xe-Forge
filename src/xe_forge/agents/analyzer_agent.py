@@ -67,6 +67,38 @@ _SYCL_SKIP_ISSUES: set[IssueType] = {
 }
 
 
+# CM ("C for Metal") is a low-level Intel GPU language. It exposes SIMD/EU
+# vector+matrix registers, the DPAS systolic array, SLM, and thread/group ids
+# directly. The descriptions below re-cast generic issue types in CM terms.
+_CM_DESCRIPTIONS: dict[IssueType, str] = {
+    IssueType.SUBOPTIMAL_TILE_SIZE: "Per-thread matrix<T,R,C> output tile suboptimal — size it to the DPAS atom (e.g. RepeatCount x 16) and EU GRF budget",
+    IssueType.SUBOPTIMAL_WARPS: "SIMD width is per-instruction and follows operand width — widen vector<>/matrix<> operands so the compiler emits wider SIMD (there is no lane-count knob; DPAS runs at a fixed execution size)",
+    IssueType.HIGH_REGISTER_PRESSURE: "Large vector<>/matrix<> live ranges spilling the GRF — shrink tiles or split the loop",
+    IssueType.CACHE_EVICTION_RISK: "Working set / SLM tile too large for L1/SLM — reduce block size or stage through SLM",
+    IssueType.UNCOALESCED_ACCESS: "Scattered / gather global loads — use LSC block loads (cm_load 1D / 2D block_2d_desc) for coalesced, cache-friendly access",
+    IssueType.DTYPE_PRECISION: "Using float32 inputs/storage where bf16/half would feed DPAS (keep float accumulators), or float64 anywhere",
+    IssueType.DTYPE_FLOAT64: "float64 in computation — extremely slow on Intel GPUs, use float/half/bf16",
+    IssueType.UNFUSED_ELEMENTWISE: "Elementwise epilogue (bias/activation) not fused into the kernel before the final store",
+    IssueType.UNFUSED_KERNELS: "Multiple CM kernel enqueues that could be fused into one",
+    IssueType.SUBOPTIMAL_ALGORITHM: "Naive loop where a DPAS-based or blocked formulation is faster",
+    IssueType.REDUNDANT_COMPUTATION: "Repeated work (addresses, partial sums) that can be hoisted out of the loop",
+    IssueType.OPEN_ENDED: (
+        "A novel optimization not covered by any existing issue_type. "
+        "Use ONLY when you have found a concrete, high-value, implementable "
+        "optimization with no matching type above. "
+        "You MUST populate open_ended_proposal with: "
+        "(a) exactly what changes, "
+        "(b) why it is valid, "
+        "(c) a before/after CM code sketch, "
+        "(d) estimated speedup with reasoning."
+    ),
+}
+
+# CM is lower-level than Triton, so the Triton/CUTLASS-only issue types do not
+# apply. Reuse the same skip set as SYCL.
+_CM_SKIP_ISSUES: set[IssueType] = set(_SYCL_SKIP_ISSUES)
+
+
 def _build_issue_categories(dsl: DSL = DSL.TRITON) -> str:
     """
     Generate the === ISSUE CATEGORIES === block from the IssueType enum + stage mapping.
@@ -175,6 +207,9 @@ def _build_issue_categories(dsl: DSL = DSL.TRITON) -> str:
     if dsl == DSL.SYCL:
         skip = _SYCL_SKIP_ISSUES
         desc_overrides = _SYCL_DESCRIPTIONS
+    elif dsl == DSL.CM:
+        skip = _CM_SKIP_ISSUES
+        desc_overrides = _CM_DESCRIPTIONS
     else:
         skip = set()
         desc_overrides = {}
@@ -208,6 +243,7 @@ def _build_issue_categories(dsl: DSL = DSL.TRITON) -> str:
 # Build once at import time — cheap, just string formatting
 _ISSUE_CATEGORIES_BLOCK = _build_issue_categories(DSL.TRITON)
 _SYCL_ISSUE_CATEGORIES_BLOCK = _build_issue_categories(DSL.SYCL)
+_CM_ISSUE_CATEGORIES_BLOCK = _build_issue_categories(DSL.CM)
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +357,59 @@ IMPORTANT:
     )
 
 
+class CMAnalysisSignature(dspy.Signature):
+    __doc__ = f"""Analyze a CM ("C for Metal") C++ kernel for optimization opportunities on Intel GPUs.
+
+You are a world-class expert in CM (C for Metal), Intel Xe GPU architecture
+(EU/Xe-core, GRF, SLM, DPAS systolic array), and high-performance kernel tuning.
+
+Analyze the given CM C++ kernel and identify ALL applicable optimizations.
+
+=== CM OPTIMIZATION KNOBS ===
+- SIMD width: per-instruction, driven by operand width — wider vector<>/matrix<>
+  operands let the compiler emit wider SIMD; there is no lane-count #define.
+  DPAS runs at a fixed execution size.
+- DPAS systolic matmul: cm_dpas<Src1Prec, Src2Prec, 8, RepeatCount>(Acc, B, A) —
+  SystolicDepth fixed at 8. bf16/half (CM_PRECISION_BF/HF) -> float acc;
+  int8 (CM_PRECISION_S8/U8) -> int32 acc. Operands packed as uint.
+- Register tiles: vector<T,N> / matrix<T,R,C> sized to the GRF budget
+- SLM staging: cm_slm_init + cm_slm_alloc, move tiles with LSC SLM ops
+  (cm_store_slm / cm_load_slm), sync with cm_slm_fence + cm_barrier
+- LSC block loads: cm_load 1D (by byte offset) or 2D block_2d_desc
+  (VNNI-transform the DPAS B tile); avoid gather/scatter
+- Thread space: cm_group_id, cm_local_id, cm_linear_global_id work partitioning
+- Loop unrolling: #pragma unroll on tight, compile-time-bounded loops
+- Prefetch: cm_prefetch to hide HBM latency
+- Data types: bf16/half inputs with float acc, or int8 (S8/U8) with int32 acc;
+  avoid double
+
+{_CM_ISSUE_CATEGORIES_BLOCK}
+IMPORTANT:
+- Return issues as a JSON array of DetectedIssue objects.
+- Each issue MUST have: issue_type (exact string from the list above),
+  severity (1-5), description, suggested_fix, estimated_speedup.
+- issue_type MUST be one of the exact strings listed above.
+- Return empty array [] ONLY if the kernel is already optimal.
+"""
+
+    kernel_code: dspy.Code["cpp"] = dspy.InputField(
+        desc="CM (C for Metal) C++ kernel source code to analyze."
+    )
+    reference_code: str = dspy.InputField(
+        desc="Reference implementation or description. May be empty."
+    )
+    problem_context: str = dspy.InputField(
+        desc="Problem size, FLOP count, target device, and other context."
+    )
+    knowledge_base_context: str = dspy.InputField(
+        desc="Constraints from the knowledge base for CM/Intel-GPU kernels. "
+        "Empty string if KB is disabled."
+    )
+    issues_found: list[DetectedIssue] = dspy.OutputField(
+        desc="List of detected issues. Return empty array [] only if kernel is already optimal."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Analyzer Agent
 # ---------------------------------------------------------------------------
@@ -332,7 +421,12 @@ class AnalyzerAgent:
     def __init__(self, knowledge_base=None, dsl: DSL | str = DSL.TRITON):
         self.knowledge_base = knowledge_base
         self.dsl = DSL(dsl) if isinstance(dsl, str) else dsl
-        sig = SyclAnalysisSignature if self.dsl == DSL.SYCL else AnalysisSignature
+        if self.dsl == DSL.CM:
+            sig = CMAnalysisSignature
+        elif self.dsl == DSL.SYCL:
+            sig = SyclAnalysisSignature
+        else:
+            sig = AnalysisSignature
         self.predictor = dspy.Predict(sig)
 
     def analyze(

@@ -13,10 +13,11 @@ class DSL(StrEnum):
     GLUON = "gluon"
     SYCL = "sycl"
     CUDA = "cuda"
+    CM = "cm"  # Intel "C for Metal" (CM) GPU kernel language
 
     @property
     def code_language(self) -> str:
-        if self in (DSL.SYCL, DSL.CUDA):
+        if self in (DSL.SYCL, DSL.CUDA, DSL.CM):
             return "cpp"
         return "python"
 

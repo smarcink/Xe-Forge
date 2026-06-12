@@ -29,6 +29,10 @@ from xe_forge.models import (
 logger = logging.getLogger(__name__)
 
 
+# dspy.Code language tag. Defined as a module global so the lazy (PEP 563)
+# annotations `dspy.Code[cpp]` resolve to dspy.Code["cpp"].
+cpp = "cpp"
+
 SUCCESS_MESSAGE = "Success! Optimization verified and kernel is faster."
 
 
@@ -78,6 +82,42 @@ def _verify_sycl(code, original_code, executor, input_shapes, spec_dims=None):
             return f"RUNTIME ERROR: {e!s}"
 
     logger.warning("No executor - accepting SYCL code based on static checks only")
+    return SUCCESS_MESSAGE
+
+
+def _verify_cm(code, original_code, executor, input_shapes, spec_dims=None, input_dtypes=None):
+    """Verify a CM C++ kernel: basic structure check + runtime comparison."""
+    if "#include" not in code:
+        return "MISSING: C++ code must contain #include directives."
+    if "_GENX_" not in code and "cm_" not in code:
+        return "MISSING: Code does not appear to be a CM kernel (no _GENX_/cm_*)."
+
+    if executor:
+        try:
+            _dims = spec_dims or dict(
+                zip(("M", "N", "K"), _extract_gemm_dims(input_shapes), strict=False)
+            )
+            comparison = executor.compare_kernels(
+                original_code=original_code,
+                optimized_code=code,
+                dims=_dims,
+                input_shapes=input_shapes,
+                input_dtypes=input_dtypes,
+            )
+            if not comparison.optimized_correct:
+                return comparison.feedback_message or "Optimized kernel failed."
+            if comparison.is_slower:
+                sd = 1.0 / comparison.speedup if comparison.speedup > 0 else float("inf")
+                return (
+                    f"PERFORMANCE REGRESSION: {sd:.2f}x SLOWER.\n"
+                    f"Original: {comparison.original_time_ms:.4f}ms\n"
+                    f"Optimized: {comparison.optimized_time_ms:.4f}ms"
+                )
+            return SUCCESS_MESSAGE
+        except Exception as e:
+            return f"RUNTIME ERROR: {e!s}"
+
+    logger.warning("No executor - accepting CM code based on static checks only")
     return SUCCESS_MESSAGE
 
 
@@ -170,6 +210,51 @@ class SyclOptimizationReActSignature(dspy.Signature):
     )
 
 
+class CMOptimizationReActSignature(dspy.Signature):
+    """Optimize a CM ("C for Metal") C++ kernel for Intel GPUs.
+
+    You are an expert CM (C for Metal) kernel optimizer for Intel Xe GPUs.
+
+    Your task: Optimize the C++ kernel for maximum performance.
+    You may change register tiling, memory access patterns, SLM usage, operand
+    widths, and DPAS configuration if the outputs remain numerically equivalent.
+
+    === OPTIMIZATION PRIORITIES ===
+    1. DPAS: map matmul/conv inner products onto
+       cm_dpas<Src1Prec, Src2Prec, 8, RepeatCount>(Acc, B, A) — SystolicDepth
+       fixed at 8. bf16/half (CM_PRECISION_BF/HF) -> float acc; int8
+       (CM_PRECISION_S8/U8) -> int32 acc. Operands packed as uint.
+    2. SIMD width: per-instruction, driven by operand width — widen
+       vector<>/matrix<> operands to get wider SIMD; there is no lane-count
+       #define. DPAS runs at a fixed execution size.
+    3. Register tiles: size vector<>/matrix<> to the GRF budget (avoid spill)
+    4. Memory: LSC 1D/2D block loads (cm_load; VNNI-transform the DPAS B tile),
+       stage reused tiles through SLM (cm_store_slm/cm_load_slm), cm_prefetch
+    5. Data types: bf16/half inputs with float acc, or int8 S8/U8 with int32
+       acc; avoid double
+    6. Unroll tight, compile-time-bounded loops with #pragma unroll
+
+    === CODE REQUIREMENTS ===
+    - Complete, valid CM C++ with all required #include directives
+      (e.g. <cm/cm.h> or <cm/cmtl.h>)
+    - Keep the extern "C" _GENX_MAIN_ kernel entry point and its signature
+    - Must compile with the cmc compiler
+    """
+
+    original_code: dspy.Code[cpp] = dspy.InputField(
+        desc="Original CM C++ kernel code for reference"
+    )
+    current_code: dspy.Code[cpp] = dspy.InputField(desc="Current CM C++ kernel code to optimize")
+    stage: str = dspy.InputField(desc="Optimization stage to apply")
+    issues: list[DetectedIssue] = dspy.InputField(desc="Specific issues to fix in this stage")
+    knowledge_patterns: str = dspy.InputField(desc="Optimization patterns and examples to follow")
+    xpu_config: str = dspy.InputField(desc="Intel GPU configuration parameters")
+
+    optimized_code: dspy.Code[cpp] = dspy.OutputField(
+        desc="Complete optimized CM C++ kernel with all #includes and the _GENX_MAIN_ entry point."
+    )
+
+
 class OptimizerReActAgent(Optimizer):
     """
     Agent that applies optimization transformations to Triton kernels using ReAct.
@@ -216,6 +301,16 @@ class OptimizerReActAgent(Optimizer):
             Returns SUCCESS_MESSAGE on success, or detailed error message.
             """
             code: str = optimized_code.code
+
+            if dsl == DSL.CM:
+                return _verify_cm(
+                    code,
+                    original_code,
+                    executor,
+                    input_shapes,
+                    spec_dims,
+                    input_dtypes,
+                )
 
             if dsl == DSL.SYCL:
                 return _verify_sycl(
@@ -392,7 +487,12 @@ class OptimizerReActAgent(Optimizer):
         )
 
         # Create ReAct agent for this optimization
-        sig = SyclOptimizationReActSignature if self.dsl == DSL.SYCL else OptimizationReActSignature
+        if self.dsl == DSL.CM:
+            sig = CMOptimizationReActSignature
+        elif self.dsl == DSL.SYCL:
+            sig = SyclOptimizationReActSignature
+        else:
+            sig = OptimizationReActSignature
         react_agent = dspy.ReAct(
             signature=sig,
             tools=[verify_tool],
@@ -435,14 +535,25 @@ class OptimizerReActAgent(Optimizer):
             last_error = None
 
             # Check syntax first
-            if self.dsl != DSL.SYCL and not self._is_valid_python(optimized_code):
+            if self.dsl not in (DSL.SYCL, DSL.CM) and not self._is_valid_python(optimized_code):
                 last_error = "Final code has invalid Python syntax"
             elif not self._is_valid_kernel(optimized_code):
                 last_error = "Final code is not a valid kernel"
-            elif self.executor and (self.dsl == DSL.SYCL or input_shapes):
+            elif self.executor and (self.dsl in (DSL.SYCL, DSL.CM) or input_shapes):
                 # Runtime verification
                 try:
-                    if self.dsl == DSL.SYCL:
+                    if self.dsl == DSL.CM:
+                        _dims = spec_dims or dict(
+                            zip(("M", "N", "K"), _extract_gemm_dims(input_shapes), strict=False)
+                        )
+                        comparison = self.executor.compare_kernels(
+                            original_code=original_code,
+                            optimized_code=optimized_code,
+                            dims=_dims,
+                            input_shapes=input_shapes,
+                            input_dtypes=input_dtypes,
+                        )
+                    elif self.dsl == DSL.SYCL:
                         _dims = spec_dims or dict(
                             zip(("M", "N", "K"), _extract_gemm_dims(input_shapes), strict=False)
                         )
@@ -581,6 +692,8 @@ class OptimizerReActAgent(Optimizer):
 
     def _is_valid_kernel(self, code: str) -> bool:
         """Check if code looks like a valid kernel for the current DSL."""
+        if self.dsl == DSL.CM:
+            return "#include" in code and ("_GENX_" in code or "cm_" in code)
         if self.dsl == DSL.SYCL:
             return "#include" in code and ("sycl" in code.lower() or "cutlass" in code.lower())
         has_triton_import = "import triton" in code or "from triton" in code

@@ -1,0 +1,214 @@
+# CM ("C for Metal") optimization patterns for Intel Xe GPUs.
+#
+# Loaded only when KNOWLEDGE_BASE_ENABLED=true (and DSL=cm). The loader reads
+# the top-level `patterns:` and `constraints:` lists; each pattern needs a
+# valid `stage` (analysis, algorithmic, dtype_fix, fusion, memory_access,
+# device_specific, autotuning, discovery).
+
+patterns:
+  - id: cm_dpas_matmul
+    name: "Use the DPAS (XMX) systolic array for the matmul inner product"
+    stage: device_specific
+    before: |
+      // Scalar/vector MAC loop over K — leaves the DPAS/XMX array idle.
+      for (int k = 0; k < K; ++k)
+        acc += a_row[k] * b_col[k];
+    after: |
+      // Map the K inner product onto cm_dpas. SystolicDepth must be 8; the K
+      // dimension is SystolicDepth * OpsPerChannel (8*2=16 for bf16/half,
+      // 8*4=32 for int8). Operands are packed into uint/int GRF registers.
+      // cm_dpas<Src1Prec, Src2Prec, SystolicDepth, RepeatCount, ResTy>(Acc, Src1=B, Src2=A)
+
+      // bf16/half inputs -> float accumulate:
+      matrix<float, RepeatCount, 16> acc = 0;
+      acc = cm_dpas<CM_PRECISION_BF, CM_PRECISION_BF, 8, RepeatCount>(
+                acc, B.format<uint>(), A.format<uint>());
+
+      // int8 inputs -> int32 accumulate (S8 weights x U8 activations):
+      matrix<int, RepeatCount, 16> iacc = 0;
+      iacc = cm_dpas<CM_PRECISION_S8, CM_PRECISION_U8, 8, RepeatCount>(
+                iacc, weights.format<uint>(), input.format<uint>());
+    description: |
+      The Xe DPAS/XMX (Dot Product Accumulate Systolic) array delivers the bulk
+      of matmul throughput. Express the K-loop inner product as cm_dpas. It
+      supports bf16/half (-> float accumulate) and int8 S8/U8 (-> int32
+      accumulate), plus tf32, bf8/hf8 and int2/int4 on capable hardware (each
+      guarded by a CM_HAS_DPAS* macro). SystolicDepth is fixed at 8; RepeatCount
+      (1..8) sets the number of A rows processed per instruction.
+    rationale: "DPAS provides far higher MAC throughput than scalar/vector FMA on the EU, for both float and integer matmul."
+    expected_speedup: "3-10x for GEMM-like inner loops"
+    applies_to: [gemm, matmul, conv, dpas, int8, quantized]
+
+  - id: cm_simd_width
+    name: "Widen vectors/matrices to let the compiler emit wider SIMD"
+    stage: device_specific
+    before: |
+      // SIMD width is per-instruction on Intel GPUs and follows the operand
+      // width. Narrow per-thread vectors force narrow SIMD instructions that
+      // under-utilize the EU.
+      vector<float, 8> v = ...;   // tends to compile to a narrow SIMD op
+    after: |
+      // Operate on wider vectors/matrices so the backend can select wider
+      // SIMD (e.g. SIMD16/SIMD32) instructions and amortize control overhead.
+      vector<float, 32> v = ...;  // wider operand -> wider SIMD instruction
+      // NOTE: there is no LANES/EXEC_SIZE #define that "sets" SIMD width.
+      // Fixed-size systolic ops are the exception: cm_dpas runs at a fixed
+      // execution size (e.g. 16); tune its throughput via RepeatCount / tile
+      // size, not by changing SIMD width.
+    description: |
+      On the Intel GPU ISA the SIMD width is chosen per instruction and is
+      driven by the width of the vector/matrix being operated on — wider
+      operands give the compiler the chance to issue wider SIMD instructions.
+      It is not selected by a macro/define. Size per-thread vectors/matrices to
+      keep the EU busy without spilling the GRF.
+    rationale: "Wider operands let the backend pick wider SIMD, raising lane utilization and hiding instruction latency."
+    expected_speedup: "1.2-2x"
+    applies_to: [elementwise, gemm, reduction]
+
+  - id: cm_loop_unroll
+    name: "Unroll tight, compile-time-bounded inner loops with #pragma unroll"
+    stage: device_specific
+    before: |
+      // Rolled inner loop: a per-iteration branch + induction-variable update,
+      // and the runtime index blocks static GRF addressing of register tiles.
+      for (int k = 0; k < K; k += TILE_K)
+        acc = cm_dpas<CM_PRECISION_BF, CM_PRECISION_BF, 8, M>(acc, b, a);
+    after: |
+      // Fully unroll small loops whose trip count is a compile-time constant.
+      // This removes loop control overhead, turns the index into a constant
+      // (required for static .select<>()/.row() GRF addressing), keeps the
+      // accumulator register-resident, and lets the scheduler interleave loads
+      // with DPAS to hide latency. Unroll tight chunk loops like this:
+      #pragma unroll
+      for (int t = 0; t < NUM_TILES; t++)          // NUM_TILES is a compile-time constant
+        tile.row(t) = cm_load<uint, TILE_ELEMS>(surf, offset[t]);
+
+      // Use a PARTIAL factor when full unroll would be too large:
+      #pragma unroll 4
+      for (int k = 0; k < K; k += TILE_K) { /* ... */ }
+
+      // And keep LARGE / runtime-bounded loops rolled to bound code size and
+      // register pressure:
+      #pragma nounroll
+      for (int i = 0; i < num_iters; i++) { /* ... */ }
+    description: |
+      #pragma unroll (optionally "#pragma unroll N" for a partial factor) tells
+      the compiler to unroll the next loop; #pragma nounroll forbids it. Full
+      unrolling needs a compile-time-constant trip count.
+      Benefits: removes branch/induction overhead; makes loop indices constant
+      so register tiles can be addressed statically with .select<>()/.row()
+      (often REQUIRED, not just faster); exposes more instruction-level
+      parallelism so loads and DPAS pipeline together.
+      Consequences: more unrolling means a larger instruction footprint and
+      more simultaneously-live values, which raises GRF pressure and can cause
+      register spills that collapse performance (see cm_grf_register_spill).
+      When useful: tight inner loops with small, fixed bounds — e.g. the K/TILE_K
+      DPAS loop and tile-chunk loops. Prefer #pragma nounroll or a small
+      partial factor for long or runtime-bounded loops.
+    rationale: "Unrolling tight constant-bound loops cuts control overhead, enables static GRF indexing, and pipelines loads with DPAS — but over-unrolling spills the GRF."
+    expected_speedup: "1.1-1.5x for tight inner loops (and can be required for static GRF indexing)"
+    applies_to: [gemm, conv, reduction, dpas, elementwise]
+
+  - id: cm_slm_staging
+    name: "Stage reused tiles through SLM with LSC SLM ops"
+    stage: memory_access
+    before: "// Every thread re-reads the same A/B tile from HBM (redundant global traffic)."
+    after: |
+      // Cooperatively stage the shared tile in SLM once, then read it back.
+      cm_slm_init(SLM_BYTES);
+      uint slm = cm_slm_alloc(SLM_BYTES);
+      // LSC SLM store of the cooperatively-loaded tile:
+      cm_store_slm<uint, N>(slm_offsets, tile);
+      cm_slm_fence(CM_GLOBAL_COHERENT_FENCE);   // order SLM writes
+      cm_barrier();                             // make them visible to the group
+      // LSC SLM load back into registers:
+      vector<uint, N> staged = cm_load_slm<uint, VectorSize::N1>(slm_offsets);
+    description: |
+      Use Shared Local Memory to reuse tiles across a thread group and cut HBM
+      traffic. Allocate with cm_slm_init / cm_slm_alloc, move data with the LSC
+      SLM ops (cm_store_slm / cm_load_slm), and synchronize with cm_slm_fence
+      + cm_barrier.
+    rationale: "SLM bandwidth is much higher than HBM; group-level reuse amortizes global loads."
+    expected_speedup: "1.5-3x for memory-bound tiles"
+    applies_to: [gemm, stencil, reduction, conv]
+
+  - id: cm_2d_block_load
+    name: "Use LSC 1D/2D block loads for coalesced HBM access"
+    stage: memory_access
+    before: |
+      // Scattered / gather reads (per-lane offsets or cm_load4) — poor coalescing.
+      vector<uint, N> v = cm_load4<uint, ...>(surf, offsets);
+    after: |
+      // LSC 1D block load (stateful, by byte offset; NElts in {1,2,4,8,16,32,64}):
+      vector<uint, NElts> v =
+          cm_load<uint, NElts, DataSize::Default, CacheHint::Cached, CacheHint::Cached>(surf, byte_offset);
+
+      // LSC 2D block load (requires CM_HAS_LSC_UNTYPED_2D). Use a VNNI transform
+      // load for the DPAS B matrix so the GRF layout feeds the systolic array:
+      lsc::block_2d_desc<half, 1, BlockH, BlockW> desc(base_ptr, H, W, pitch, x, y);
+      auto b_tile = cm_load<half, BlockH, BlockW, 1, lsc::LoadOp::VNNI>(desc);
+    description: |
+      Replace scattered/gather reads with explicit LSC block loads so
+      neighboring lanes hit contiguous memory. cm_load (1D) reads a contiguous
+      block by byte offset; the 2D block_2d_desc form reads a rectangular tile
+      and can Transpose (LoadOp::Transpose) or VNNI-transform (LoadOp::VNNI) it
+      in flight to feed DPAS.
+    rationale: "Coalesced LSC block reads maximize cache-line utilization and HBM efficiency; the 2D form also lays out tiles for DPAS."
+    expected_speedup: "1.3-2x"
+    applies_to: [gemm, conv, memory_bound]
+
+  - id: cm_dtype_accumulate
+    name: "Match DPAS input/accumulator dtypes (float for fp, int32 for int8)"
+    stage: dtype_fix
+    before: "matrix<float, R, C> a, b;  // float32 inputs fed straight into the matmul"
+    after: |
+      // bf16/half inputs -> float accumulate:
+      matrix<half, R, C> a, b; matrix<float, R, C> acc;
+      // int8 inputs (packed into uint/int) -> int32 accumulate:
+      // S8/U8 operands with a vector<int, ...> accumulator via
+      // cm_dpas<CM_PRECISION_S8, CM_PRECISION_U8, 8, RepeatCount>.
+    description: |
+      Feed DPAS with its native low-precision operands and accumulate in the
+      matching wide type: bf16/half (and tf32, bf8/hf8) accumulate in float;
+      int8 (S8/U8) accumulates in int32. This preserves accuracy while keeping
+      the systolic array fed.
+    rationale: "DPAS native input types are narrow (bf16/half/int8); wide accumulation (float/int32) preserves numerical accuracy."
+    expected_speedup: "up to 2x vs float32 inputs"
+    applies_to: [gemm, matmul, mixed_precision, int8, quantized]
+
+  - id: cm_fuse_epilogue
+    name: "Fuse elementwise post-ops before the store"
+    stage: fusion
+    before: "// Kernel writes its result; a second kernel reads it back to apply bias/activation/scale."
+    after: "// Apply the elementwise post-op on the result in-register, then store once."
+    description: |
+      Fold elementwise post-ops (bias add, activation, scale, clamp, type
+      conversion, etc.) into the kernel that produces the data so the result is
+      written to HBM only once. This applies to ANY kernel followed by an
+      elementwise pass — not just GEMM/FFN — including convolutions, reductions
+      and pure elementwise chains.
+    rationale: "Avoids an extra HBM round-trip and a second kernel enqueue."
+    expected_speedup: "1.2-1.5x when the epilogue is memory-bound"
+    applies_to: [gemm, conv, reduction, elementwise, activation, ffn, any]
+
+constraints:
+  - id: cm_dtype_float64_forbidden
+    name: "Avoid float64 (double) in CM kernels"
+    description: "Double precision is extremely slow on Intel GPUs; use float/half/bfloat16."
+    severity: critical
+
+  - id: cm_grf_register_spill
+    name: "Keep register tiles within the GRF budget"
+    description: |
+      Oversized vector<>/matrix<> live ranges spill to memory and collapse
+      performance. Size per-thread tiles to the EU GRF budget (and chosen GRF
+      mode); reduce tile size or split the K-loop if spilling occurs.
+    severity: critical
+
+  - id: cm_coalesced_contiguous_access
+    name: "Keep global memory access coalesced via LSC block loads"
+    description: |
+      Prefer LSC block access (cm_load 1D / 2D block_2d_desc) over gather/scatter
+      (cm_load4 / per-lane offsets) so a SIMD memory op maps to contiguous HBM
+      and full cache lines.
+    severity: warning

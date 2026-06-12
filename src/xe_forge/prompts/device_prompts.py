@@ -18,6 +18,7 @@ _DSL_NAMES: dict[str, str] = {
     "gluon": "Gluon",
     "sycl": "SYCL/XeTLA",
     "cuda": "CUDA C++",
+    "cm": "C-for-Metal (CM)",
 }
 
 _DEVICE_TUNING_DEFAULTS: dict[str, dict[str, int | str]] = {
@@ -83,6 +84,16 @@ class PromptLibrary:
         defaults = self.tuning_defaults()
 
         if stage == "device_specific":
+            if self.dsl == "cm":
+                return (
+                    "Intel Xe CM tuning: map matmul/conv inner loops onto the "
+                    "DPAS/XMX systolic array (SystolicDepth=8; bf16/half->float, "
+                    "int8 S8/U8->int32). SIMD width is per-instruction — widen "
+                    "vector<>/matrix<> operands instead of setting a lane count. "
+                    "Use LSC 1D/2D block loads for coalesced HBM access, stage "
+                    "reused tiles through SLM, and keep register tiles within the "
+                    f"GRF budget (grf_mode={defaults.get('grf_mode', 'large')})."
+                )
             if self.device_type == "xpu":
                 return (
                     f"Intel XPU tuning: BLOCK_M={defaults['BLOCK_M']}, "
@@ -141,6 +152,11 @@ class PromptLibrary:
         if self.dsl == "cuda":
             return [
                 "Must be valid CUDA C++ code",
+            ]
+        if self.dsl == "cm":
+            return [
+                "Must be valid C-for-Metal (CM) C++ code",
+                "Must contain a _GENX_MAIN_ kernel entry point",
             ]
         return []
 

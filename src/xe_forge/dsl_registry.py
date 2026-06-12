@@ -48,6 +48,16 @@ DSL_SUPPORTED_STAGES: dict[DSL, set[OptimizationStage]] = {
         OptimizationStage.AUTOTUNING,
         OptimizationStage.DISCOVERY,
     },
+    DSL.CM: {
+        OptimizationStage.ANALYSIS,
+        OptimizationStage.ALGORITHMIC,
+        OptimizationStage.DTYPE_FIX,
+        OptimizationStage.FUSION,
+        OptimizationStage.MEMORY_ACCESS,
+        OptimizationStage.PERSISTENT_KERNEL,
+        OptimizationStage.DEVICE_SPECIFIC,
+        OptimizationStage.DISCOVERY,
+    },
 }
 
 

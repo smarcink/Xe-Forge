@@ -63,7 +63,13 @@ class XeForgePipeline:
         self._setup_llm()
 
         if executor is None:
-            if self.config.device_config.dsl == DSL.SYCL:
+            if self.config.device_config.dsl == DSL.CM:
+                from xe_forge.core import CMExecutor
+
+                executor = CMExecutor(
+                    verify=self.config.optimization.require_correctness,
+                )
+            elif self.config.device_config.dsl == DSL.SYCL:
                 from xe_forge.core import SyclExecutor
 
                 executor = SyclExecutor(
@@ -220,24 +226,27 @@ class XeForgePipeline:
         logger.info(f"Starting optimization for kernel: {display_name}")
 
         val_orig_tflops, val_orig_ms = None, None
+        from xe_forge.core.cm_executor import CMExecutor
         from xe_forge.core.executor import KernelBenchExecutor
         from xe_forge.core.sycl_executor import SyclExecutor
 
-        _is_sycl = isinstance(self.executor, SyclExecutor)
+        # SYCL and CM both use a dims-based, original-vs-optimized C++ executor
+        # (no PyTorch reference), so they share the same baseline path.
+        _is_cpp = isinstance(self.executor, (SyclExecutor, CMExecutor))
         _bench_ex = (
             self.executor
-            if isinstance(self.executor, (KernelBenchExecutor, SyclExecutor))
+            if isinstance(self.executor, (KernelBenchExecutor, SyclExecutor, CMExecutor))
             else KernelBenchExecutor(device=self.config.device_config.device)
         )
-        if self.executor and (_is_sycl or input_shapes):
+        if self.executor and (_is_cpp or input_shapes):
             try:
-                if _is_sycl:
-                    _sycl_dims = spec_dims or dict(
+                if _is_cpp:
+                    _cpp_dims = spec_dims or dict(
                         zip(("M", "N", "K"), _extract_gemm_dims(input_shapes), strict=False)
                     )
                     orig_r = _bench_ex.execute(
                         kernel_code=kernel_code,
-                        dims=_sycl_dims,
+                        dims=_cpp_dims,
                     )
                 else:
                     orig_r = _bench_ex.execute(
@@ -497,12 +506,12 @@ class XeForgePipeline:
                     target_dtype=etd,
                 )
 
-            if self.executor and (_is_sycl or input_shapes) and current_code != kernel_code:
+            if self.executor and (_is_cpp or input_shapes) and current_code != kernel_code:
                 try:
-                    if _is_sycl:
+                    if _is_cpp:
                         opt_r = _bench_ex.execute(
                             kernel_code=current_code,
-                            dims=_sycl_dims,
+                            dims=_cpp_dims,
                         )
                     else:
                         opt_r = _bench_ex.execute(
