@@ -27,7 +27,7 @@ def test_grid_parser_basic():
     result = parser._safe_eval("max(8, 16)", {})
     assert result == 16, f"Expected 16, got {result}"
 
-    print("✓ Basic grid parser tests passed")
+    print("[OK] Basic grid parser tests passed")
 
 
 def test_define_extraction():
@@ -48,7 +48,7 @@ cm_gemm(SurfaceIndex A, int M, int N) {
     defines = parser.extract_defines(kernel_source)
 
     assert defines == {"BLOCK_M": 8, "BLOCK_N": 16, "BLOCK_K": 32}, f"Got {defines}"
-    print("✓ Define extraction test passed")
+    print("[OK] Define extraction test passed")
 
 
 def test_validate_references():
@@ -61,9 +61,9 @@ def test_validate_references():
     # Valid expression
     try:
         parser.validate_references("ceil(M / BLOCK_M)", dims, defines)
-        print("✓ Valid reference check passed")
+        print("[OK] Valid reference check passed")
     except ValueError as e:
-        raise AssertionError(f"Valid expression rejected: {e}")
+        raise AssertionError(f"Valid expression rejected: {e}") from e
 
     # Invalid expression (missing BLOCK_K)
     try:
@@ -71,7 +71,47 @@ def test_validate_references():
         raise AssertionError("Should have rejected missing BLOCK_K")
     except ValueError as e:
         assert "BLOCK_K" in str(e), f"Expected BLOCK_K in error, got: {e}"
-        print("✓ Invalid reference check passed")
+        print("[OK] Invalid reference check passed")
+
+
+def test_define_extraction_hex():
+    """Hex/oct/bin #define values are parsed, function-like macros are skipped."""
+    parser = GridParser()
+    defines = parser.extract_defines(
+        "#define BLOCK_M 0x10\n"
+        "#define BLOCK_N 8  // trailing comment\n"
+        "#define SQUARE(x) ((x)*(x))\n"
+    )
+    assert defines == {"BLOCK_M": 16, "BLOCK_N": 8}, f"Got {defines}"
+    print("[OK] Hex/comment/macro define extraction test passed")
+
+
+def test_unsafe_expression_rejected():
+    """The evaluator must reject power operators and arbitrary calls (no eval())."""
+    parser = GridParser()
+    for bad in ["9 ** 9 ** 9", "__import__('os')", "M.__class__", "open('x')"]:
+        try:
+            parser._safe_eval(bad, {"M": 256})
+            raise AssertionError(f"Should have rejected unsafe expression: {bad!r}")
+        except ValueError:
+            pass
+    print("[OK] Unsafe expression rejection test passed")
+
+
+def test_missing_symbol_diagnostic():
+    """A missing knob is reported as a #define gap, not lumped with problem dims."""
+    kernel_source = "#define BLOCK_M 8\n"  # BLOCK_N intentionally absent
+    grid_spec = {"x": "ceil(M / BLOCK_M)", "y": "ceil(N / BLOCK_N)", "z": 1}
+    try:
+        parse_grid_from_kernel_and_spec(kernel_source, grid_spec, {"M": 256, "N": 256})
+        raise AssertionError("Should have rejected missing BLOCK_N")
+    except ValueError as e:
+        msg = str(e)
+        assert "BLOCK_N" in msg, f"Expected BLOCK_N in error, got: {msg}"
+        # The message must distinguish kernel #defines (BLOCK_M present) from dims.
+        assert "BLOCK_M" in msg and "#define" in msg, f"Diagnostic not actionable: {msg}"
+        print("[OK] Missing-symbol diagnostic test passed")
+
 
 
 def test_grid_config_from_seed_kernel():
@@ -110,7 +150,7 @@ cm_gemm(SurfaceIndex surfA [[type("buffer_t")]],
     assert grid.global_size == (32, 16, 1), f"Expected (32, 16, 1), got {grid.global_size}"
     assert grid.local_size == (1, 1, 1), f"Expected (1, 1, 1), got {grid.local_size}"
 
-    print("✓ Seed kernel grid evaluation test passed")
+    print("[OK] Seed kernel grid evaluation test passed")
 
 
 def test_load_spec_with_grid_and_outputs():
@@ -129,7 +169,7 @@ def test_load_spec_with_grid_and_outputs():
             break
 
     if not spec_path:
-        print(f"⚠ Skipping spec load test (file not found in any of: {possible_paths})")
+        print(f"[SKIP] spec load test (file not found in any of: {possible_paths})")
         return
 
     spec = load_spec(spec_path)
@@ -146,13 +186,16 @@ def test_load_spec_with_grid_and_outputs():
     assert spec.grid["x"] == "ceil(M / BLOCK_M)", f"Got {spec.grid['x']}"
     assert spec.grid["y"] == "ceil(N / BLOCK_N)", f"Got {spec.grid['y']}"
 
-    print("✓ Spec load with grid/outputs test passed")
+    print("[OK] Spec load with grid/outputs test passed")
 
 
 if __name__ == "__main__":
     test_grid_parser_basic()
     test_define_extraction()
     test_validate_references()
+    test_define_extraction_hex()
+    test_unsafe_expression_rejected()
+    test_missing_symbol_diagnostic()
     test_grid_config_from_seed_kernel()
     test_load_spec_with_grid_and_outputs()
-    print("\n✅ All grid tests passed!")
+    print("\nAll grid tests passed!")

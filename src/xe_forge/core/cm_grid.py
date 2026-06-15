@@ -3,20 +3,33 @@ CM Grid Configuration and Evaluation.
 
 Parses and validates grid specifications from YAML and kernel #defines:
 - Grid formulas: expressions over problem dims (from spec) and tuning knobs (from kernel)
-- Supports: ceil(), min(), max(), arithmetic
+- Supports: ceil(), floor(), min(), max(), and + - * / // % arithmetic
 - Validates that referenced symbols are either problem dims or #define'd in kernel
-- Evaluates to concrete global/local work sizes for kerneles launch
+- Evaluates to concrete global/local work sizes for kernel launch
+
+Expressions are evaluated with a restricted AST walker (no ``eval``): only the
+whitelisted functions/operators above and numeric literals are permitted, so a
+malformed or hostile grid formula cannot execute arbitrary code or hang the
+process.
 """
 
 from __future__ import annotations
 
+import ast
 import logging
+import math
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Whitelisted helpers usable inside grid expressions.
+_ALLOWED_FUNCS = {"ceil": math.ceil, "floor": math.floor, "min": min, "max": max}
+# Whitelisted operators. Pow (``**``) is intentionally excluded: grid math never
+# needs it, and ``a ** b`` with large operands is a cheap denial-of-service vector.
+_ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.FloorDiv, ast.Mod)
+_ALLOWED_UNARYOPS = (ast.UAdd, ast.USub)
 
 
 @dataclass
@@ -25,45 +38,51 @@ class GridConfig:
 
     global_size: tuple[int, int, int]  # ND-range [x, y, z]
     local_size: tuple[int, int, int] = (1, 1, 1)  # Work-group size [x, y, z]
-    formulas: dict[str, str] | None = None  # Original formulas for debugging
+    formulas: dict[str, Any] | None = None  # Original formulas for debugging
 
     def __post_init__(self):
-        """Validate that global and local sizes are positive."""
-        for dim, name in zip(self.global_size, ("global_x", "global_y", "global_z")):
-            if dim <= 0:
-                raise ValueError(f"{name} must be > 0, got {dim}")
-        for dim, name in zip(self.local_size, ("local_x", "local_y", "local_z")):
-            if dim <= 0:
-                raise ValueError(f"{name} must be > 0, got {dim}")
+        """Validate that every global and local size is positive."""
+        names = ("global_x", "global_y", "global_z", "local_x", "local_y", "local_z")
+        for value, name in zip((*self.global_size, *self.local_size), names, strict=False):
+            if value <= 0:
+                raise ValueError(f"{name} must be > 0, got {value}")
 
 
 class GridParser:
-    """Parses grid specifications from YAML and evaluates them against dims + kernel defines."""
+    """Parses grid specs from YAML and evaluates them against dims + kernel defines."""
 
-    # Regex to extract #define NAME VALUE
-    _DEFINE_PATTERN = re.compile(r"^\s*#define\s+(\w+)\s+(\d+)", re.MULTILINE)
+    # #define NAME VALUE — value token captured up to whitespace/comment, parsed below.
+    _DEFINE_PATTERN = re.compile(r"^[ \t]*#define[ \t]+(\w+)[ \t]+([^\s/]+)", re.MULTILINE)
 
-    # Symbols that are built-in functions
-    _BUILTINS = {"ceil", "min", "max"}
+    # Identifiers that are built-in helpers, not symbols to resolve.
+    _BUILTINS = frozenset(_ALLOWED_FUNCS)
 
-    def __init__(self):
-        self._defines: dict[str, int] = {}
-        self._dims: dict[str, int] = {}
+    @staticmethod
+    def _parse_int_token(token: str) -> int | None:
+        """Parse an integer #define value (decimal or 0x/0o/0b prefixed), else None."""
+        try:
+            return int(token, 0)  # honors 0x.., 0o.., 0b.. prefixes
+        except ValueError:
+            pass
+        try:
+            return int(token)  # plain decimal, incl. accidental leading zeros
+        except ValueError:
+            return None
 
     def extract_defines(self, kernel_source: str) -> dict[str, int]:
-        """Extract all integer #define NAME VALUE from kernel source.
+        """Extract integer ``#define NAME VALUE`` pairs from kernel source.
 
-        Returns a dict of {name: value} for symbols referenced in grid expressions.
-        Only extracts simple integer defines; complex macros are ignored.
+        Only simple integer defines (decimal or hex/oct/bin) are returned;
+        expression-valued or function-like macros are ignored.
         """
-        defines = {}
-        for match in self._DEFINE_PATTERN.finditer(kernel_source):
-            name, value_str = match.groups()
-            try:
-                defines[name] = int(value_str)
-            except ValueError:
-                logger.debug(f"Skipping non-integer #define {name} = {value_str}")
-        logger.debug(f"Extracted #defines from kernel: {defines}")
+        defines: dict[str, int] = {}
+        for name, token in self._DEFINE_PATTERN.findall(kernel_source):
+            value = self._parse_int_token(token)
+            if value is None:
+                logger.debug("Skipping non-integer #define %s = %s", name, token)
+            else:
+                defines[name] = value
+        logger.debug("Extracted #defines from kernel: %s", defines)
         return defines
 
     def validate_references(
@@ -73,27 +92,21 @@ class GridParser:
         defines: dict[str, int],
         expr_name: str = "grid",
     ) -> None:
-        """Validate that all symbols in grid_expr are either dims or #define'd.
+        """Ensure every symbol in ``grid_expr`` is a problem dim or a kernel #define.
 
-        Raises ValueError if a symbol is missing.
+        Raises ValueError naming the missing symbol(s) and which bucket they
+        belong to, so the kernel author / LLM gets an actionable message.
         """
-        # Extract all identifiers (word characters)
-        identifiers = set(re.findall(r"\b([a-zA-Z_]\w*)\b", grid_expr))
-
-        # Remove builtins
-        unknowns = identifiers - self._BUILTINS
-
-        # Check each unknown symbol
-        missing = []
-        for sym in unknowns:
-            if sym not in dims and sym not in defines:
-                missing.append(sym)
-
+        identifiers = set(re.findall(r"[A-Za-z_]\w*", grid_expr))
+        missing = sorted(
+            s for s in identifiers - self._BUILTINS if s not in dims and s not in defines
+        )
         if missing:
             raise ValueError(
-                f"{expr_name} references undefined symbols: {sorted(missing)}. "
-                f"Expected to find them in problem dims {set(dims.keys())} "
-                f"or kernel #defines {set(defines.keys())}"
+                f"{expr_name} references undefined symbol(s) {missing}. "
+                f"Known problem dims: {sorted(dims)}; kernel #defines: {sorted(defines)}. "
+                f"Add a tuning knob as `#define <NAME> <int>` in the kernel, "
+                f"or add a problem dimension to the spec's dims."
             )
 
     def evaluate(
@@ -102,136 +115,151 @@ class GridParser:
         dims: dict[str, int],
         kernel_source: str,
     ) -> GridConfig:
-        """Parse and evaluate grid specification.
+        """Parse and evaluate a grid specification.
 
         Args:
-            grid_spec: Dict with keys "x", "y", "z" (global) and optionally "local"
-                      Each value is a string expression to evaluate.
-            dims: Problem dimension values (e.g., {"M": 1024, "N": 1024, "K": 1024})
-            kernel_source: The full kernel C++ source (to extract #defines)
+            grid_spec: Dict with keys "x", "y", "z" (global) and an optional "local"
+                       nested dict of the same shape. Values are ints or string
+                       expressions over problem dims and kernel #defines.
+            dims: Problem dimension values (e.g., {"M": 1024, "N": 1024, "K": 1024}).
+            kernel_source: Full kernel C++ source (to extract #defines from).
 
         Returns:
             GridConfig with evaluated global/local sizes.
 
         Raises:
             ValueError: If grid_spec is malformed, references missing symbols,
-                       or evaluation fails.
+                        or an expression cannot be evaluated.
         """
         if grid_spec is None:
-            # Default grid: covers problem size with BLOCK_M/N (must be in kernel)
+            # Default grid: cover the problem with BLOCK_M/N (must exist in kernel).
             logger.warning("No grid specified; using default (requires BLOCK_M, BLOCK_N in kernel)")
-            grid_spec = {
-                "x": "ceil(M / BLOCK_M)",
-                "y": "ceil(N / BLOCK_N)",
-                "z": 1,
-            }
+            grid_spec = {"x": "ceil(M / BLOCK_M)", "y": "ceil(N / BLOCK_N)", "z": 1}
 
-        # Extract kernel defines
         defines = self.extract_defines(kernel_source)
 
-        # Build evaluation context
-        context = {**dims, **defines}
+        global_size = self._evaluate_grid_dims(grid_spec, dims, defines, "global")
+        local_size = self._evaluate_grid_dims(grid_spec.get("local"), dims, defines, "local")
 
-        # Parse global (x, y, z)
-        global_size = self._evaluate_grid_dims(grid_spec, context, "global")
-
-        # Parse local (optional, default [1,1,1])
-        local_spec = grid_spec.get("local", {})
-        local_size = self._evaluate_grid_dims(local_spec, context, "local", default=1)
-
-        # Validate coverage: global >= local (each dimension)
-        for g, l, axis in zip(global_size, local_size, "xyz"):
-            if l > g:
+        for axis, g, loc in zip("xyz", global_size, local_size, strict=True):
+            if loc > g:
                 logger.warning(
-                    f"local.{axis} ({l}) > global.{axis} ({g}); "
-                    "OpenCL will auto-reduce local to fit global"
+                    "local.%s (%d) > global.%s (%d); the runtime will clamp it to fit",
+                    axis,
+                    loc,
+                    axis,
+                    g,
                 )
 
         result = GridConfig(global_size=global_size, local_size=local_size, formulas=dict(grid_spec))
-        logger.info(f"Evaluated grid: global={result.global_size}, local={result.local_size}")
+        logger.info("Evaluated grid: global=%s, local=%s", result.global_size, result.local_size)
         return result
 
     def _evaluate_grid_dims(
         self,
         spec: dict[str, Any] | None,
-        context: dict[str, int],
+        dims: dict[str, int],
+        defines: dict[str, int],
         kind: str,
         default: int = 1,
     ) -> tuple[int, int, int]:
-        """Evaluate grid dimensions [x, y, z] from spec dict.
+        """Evaluate the [x, y, z] of a global/local grid spec dict.
 
-        Args:
-            spec: Dict with optional keys "x", "y", "z" (string expressions).
-            context: Symbol table {name: value} for evaluation.
-            kind: "global" or "local" (for error messages).
-            default: Default value for omitted dimensions.
-
-        Returns:
-            Tuple (x, y, z) of evaluated integers.
-
-        Raises:
-            ValueError: If expressions can't be evaluated or reference missing symbols.
+        ``dims`` and ``defines`` are kept separate (not merged) so reference
+        validation can report exactly where a missing symbol should be defined.
         """
         if not spec:
             return (default, default, default)
 
-        dims_dict = {}
+        symbols = {**dims, **defines}
+        out: dict[str, int] = {}
         for axis in "xyz":
-            if axis in spec:
-                expr = spec[axis]
-                if isinstance(expr, int):
-                    dims_dict[axis] = expr
-                else:
-                    expr_str = str(expr).strip()
-                    # Validate references
-                    self.validate_references(expr_str, context, {}, f"{kind}.{axis}")
-                    # Evaluate
-                    try:
-                        val = self._safe_eval(expr_str, context)
-                        dims_dict[axis] = int(val)
-                    except Exception as e:
-                        raise ValueError(
-                            f"Failed to evaluate {kind}.{axis} = {expr_str!r}: {e}"
-                        ) from e
-            else:
-                dims_dict[axis] = default
+            if axis not in spec:
+                out[axis] = default
+                continue
+            expr = spec[axis]
+            if isinstance(expr, bool):
+                raise ValueError(f"{kind}.{axis} must be an int/expression, got bool {expr!r}")
+            if isinstance(expr, int):
+                out[axis] = expr
+                continue
+            expr_str = str(expr).strip()
+            self.validate_references(expr_str, dims, defines, f"{kind}.{axis}")
+            try:
+                out[axis] = int(self._safe_eval(expr_str, symbols))
+            except ValueError as e:
+                raise ValueError(f"Failed to evaluate {kind}.{axis} = {expr_str!r}: {e}") from e
 
-        return (dims_dict["x"], dims_dict["y"], dims_dict["z"])
+        return (out["x"], out["y"], out["z"])
 
-    def _safe_eval(self, expr: str, context: dict[str, Any]) -> Any:
-        """Safely evaluate a mathematical expression with ceil, min, max support.
+    def _safe_eval(self, expr: str, context: dict[str, Any]) -> int | float:
+        """Evaluate ``expr`` against ``context`` using a restricted AST walker.
 
-        Args:
-            expr: String expression like "ceil(M/BLOCK_M)" or "min(N, 256)".
-            context: Symbol table {name: value}.
-
-        Returns:
-            Evaluated result (typically an int or float).
-
-        Raises:
-            ValueError: If expression is malformed or references missing symbols.
+        Supports the whitelisted functions (ceil/floor/min/max), numeric literals,
+        and + - * / // % with unary +/-. Anything else (attribute access, calls to
+        other names, ``**``, comprehensions, ...) raises ValueError.
         """
-        import math
-
-        # Build safe builtins: only math functions we allow
-        safe_builtins = {
-            "ceil": math.ceil,
-            "min": min,
-            "max": max,
-            "__builtins__": {},
-        }
-
-        # Combine with context (problem dims + kernel defines)
-        eval_context = {**context, **safe_builtins}
-
         try:
-            return eval(expr, {"__builtins__": {}}, eval_context)
-        except NameError as e:
-            raise ValueError(f"Undefined symbol in expression: {e}") from e
+            tree = ast.parse(expr, mode="eval")
+        except SyntaxError as e:
+            raise ValueError(f"Invalid grid expression {expr!r}: {e.msg}") from e
+        return self._eval_node(tree.body, context, expr)
+
+    def _eval_node(self, node: ast.AST, context: dict[str, Any], expr: str) -> int | float:
+        """Recursively evaluate a single whitelisted AST node."""
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, bool) or not isinstance(node.value, int | float):
+                raise ValueError(f"Non-numeric literal {node.value!r} in {expr!r}")
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id in context:
+                return context[node.id]
+            raise ValueError(f"Undefined symbol {node.id!r} in expression {expr!r}")
+        if isinstance(node, ast.BinOp):
+            if not isinstance(node.op, _ALLOWED_BINOPS):
+                raise ValueError(f"Operator {type(node.op).__name__} not allowed in {expr!r}")
+            left = self._eval_node(node.left, context, expr)
+            right = self._eval_node(node.right, context, expr)
+            return self._apply_binop(node.op, left, right)
+        if isinstance(node, ast.UnaryOp):
+            if not isinstance(node.op, _ALLOWED_UNARYOPS):
+                raise ValueError(f"Unary {type(node.op).__name__} not allowed in {expr!r}")
+            operand = self._eval_node(node.operand, context, expr)
+            return operand if isinstance(node.op, ast.UAdd) else -operand
+        if isinstance(node, ast.Call):
+            return self._eval_call(node, context, expr)
+        raise ValueError(f"Unsupported expression element {type(node).__name__} in {expr!r}")
+
+    def _eval_call(self, node: ast.Call, context: dict[str, Any], expr: str) -> int | float:
+        """Evaluate a call to one of the whitelisted helper functions."""
+        if not isinstance(node.func, ast.Name) or node.func.id not in _ALLOWED_FUNCS:
+            name = getattr(node.func, "id", type(node.func).__name__)
+            raise ValueError(f"Call to {name!r} not allowed in {expr!r}")
+        if node.keywords:
+            raise ValueError(f"Keyword arguments not allowed in {expr!r}")
+        args = [self._eval_node(a, context, expr) for a in node.args]
+        try:
+            return _ALLOWED_FUNCS[node.func.id](*args)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Bad call to {node.func.id}() in {expr!r}: {e}") from e
+
+    @staticmethod
+    def _apply_binop(op: ast.operator, left: int | float, right: int | float) -> int | float:
+        """Apply a whitelisted binary operator, mapping div-by-zero to ValueError."""
+        try:
+            if isinstance(op, ast.Add):
+                return left + right
+            if isinstance(op, ast.Sub):
+                return left - right
+            if isinstance(op, ast.Mult):
+                return left * right
+            if isinstance(op, ast.Div):
+                return left / right
+            if isinstance(op, ast.FloorDiv):
+                return left // right
+            return left % right  # ast.Mod — only remaining allowed op
         except ZeroDivisionError as e:
-            raise ValueError(f"Division by zero in expression: {e}") from e
-        except Exception as e:
-            raise ValueError(f"Evaluation error: {e}") from e
+            raise ValueError(f"Division by zero: {e}") from e
 
 
 def parse_grid_from_kernel_and_spec(
