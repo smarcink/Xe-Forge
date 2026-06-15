@@ -1,12 +1,12 @@
 # Spec for the naive CM GEMM seed kernel: D = A @ B
-# A: [M, K] bf16, B: [K, N] bf16, D: [M, N] fp32.
+# A: [M, K] fp16, B: [K, N] fp16, D: [M, N] fp32.
 inputs:
   A:
     shape: [M, K]
-    dtype: bfloat16
+    dtype: float16
   B:
     shape: [K, N]
-    dtype: bfloat16
+    dtype: fp16
 
 ci:
   - params: [A, B]
