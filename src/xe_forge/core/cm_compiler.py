@@ -27,6 +27,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from xe_forge.core.cm_grid import GridConfig
+
 logger = logging.getLogger(__name__)
 
 CM_ROOT = os.environ.get("CM_ROOT", "")
@@ -76,6 +78,7 @@ class CMRunResult:
     time_ms: float | None = None
     tflops: float | None = None
     error: str = ""
+    grid: GridConfig | None = None  # Grid configuration used for launch
 
 
 class CMCompiler:
@@ -187,6 +190,32 @@ class CMCompiler:
         self.last_compile_error = None
         logger.info("Compiled CM kernel -> %s", out_path)
         return out_path
+
+    def compute_grid(
+        self,
+        kernel_source: str,
+        grid_spec: dict | None,
+        dims: dict[str, int | float] | None = None,
+    ) -> GridConfig:
+        """Compute grid configuration from kernel source and grid specification.
+
+        Args:
+            kernel_source: The full CM kernel C++ source (to extract #defines).
+            grid_spec: Grid spec from YAML (e.g., {"x": "ceil(M/BLOCK_M)", "y": ...}).
+            dims: Problem dimensions for this variant (e.g., {"M": 1024, ...}).
+
+        Returns:
+            GridConfig with concrete global/local work sizes.
+
+        Raises:
+            ValueError: If grid can't be computed (missing #defines, bad expressions).
+        """
+        from xe_forge.core.cm_grid import parse_grid_from_kernel_and_spec
+
+        dims = dims or {}
+        # Ensure dims are ints (may come as floats from CLI)
+        dims_int = {k: int(v) for k, v in dims.items()}
+        return parse_grid_from_kernel_and_spec(kernel_source, grid_spec, dims_int)
 
     def run(
         self,

@@ -26,6 +26,7 @@ import torch
 from ai_bench.harness.runner.benchmark_compare import set_all_seeds
 
 from xe_forge.core.cm_compiler import CM_ROOT, CMCompiler, CMRunResult
+from xe_forge.core.cm_grid import GridConfig
 from xe_forge.core.sycl_executor import KernelType, _save_tensor
 from xe_forge.models import ExecutionResult
 
@@ -275,6 +276,27 @@ class CMExecutor:
             return False, "", err
         logger.info("Compilation succeeded: %s", binary)
         return True, str(binary), ""
+
+    def compute_grid(
+        self,
+        kernel_source: str,
+        grid_spec: dict | None,
+        dims: dict[str, int | float] | None = None,
+    ) -> GridConfig:
+        """Compute grid configuration from kernel source and grid specification.
+
+        Args:
+            kernel_source: The full CM kernel C++ source (to extract #defines).
+            grid_spec: Grid spec from YAML (e.g., {"x": "ceil(M/BLOCK_M)", "y": ...}).
+            dims: Problem dimensions for this variant (e.g., {"M": 1024, ...}).
+
+        Returns:
+            GridConfig with concrete global/local work sizes.
+
+        Raises:
+            ValueError: If grid can't be computed (missing #defines, bad expressions).
+        """
+        return self._compiler.compute_grid(kernel_source, grid_spec, dims)
 
     @staticmethod
     def _gemm_specs_from_dims(

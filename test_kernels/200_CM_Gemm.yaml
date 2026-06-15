@@ -8,6 +8,16 @@ inputs:
     shape: [K, N]
     dtype: float16
 
+outputs:
+  D:
+    shape: [M, N]
+    dtype: float32
+
+grid:
+  x: "ceil(M / BLOCK_M)"
+  y: "ceil(N / BLOCK_N)"
+  z: 1
+
 ci:
   - params: [A, B]
     dims:

@@ -81,6 +81,13 @@ class KernelSpec:
     bench_gpu: list[VariantSpec] = field(default_factory=list)
     bench_xpu: list[VariantSpec] = field(default_factory=list)
 
+    # Output tensors (for CM kernels): {"name": InputSpec} with shape/dtype.
+    outputs: dict[str, InputSpec] = field(default_factory=dict)
+
+    # Grid specification (for CM kernels): {"x": expr, "y": expr, "z": expr, "local": {...}}
+    # Expressions can reference problem dims and kernel #define'd values.
+    grid: dict | None = None
+
     # Stores all variant keys (base families, numbered, and arbitrary names)
     # keyed by their exact YAML key so callers can request them by name.
     _named_variants: dict[str, list[VariantSpec]] = field(default_factory=dict, repr=False)
@@ -392,6 +399,17 @@ def parse_spec(data: dict) -> KernelSpec:
                 dtype=input_data.get(InKey.TYPE, "float32"),
             )
 
+    outputs: dict[str, InputSpec] = {}
+    if "outputs" in data:
+        for name, output_data in data["outputs"].items():
+            outputs[name] = InputSpec(
+                name=name,
+                shape_vars=output_data.get(InKey.SHAPE, []),
+                dtype=output_data.get(InKey.TYPE, "float32"),
+            )
+
+    grid = data.get("grid")
+
     inits = data.get(SpecKey.INITS, [])
 
     # Known base family keys → KernelSpec attribute names
@@ -403,7 +421,7 @@ def parse_spec(data: dict) -> KernelSpec:
     }
 
     # Non-variant scalar/dict keys that should never be treated as variants.
-    NON_VARIANT_KEYS = {SpecKey.INS, SpecKey.INITS, "default_variant"}
+    NON_VARIANT_KEYS = {SpecKey.INS, SpecKey.INITS, "outputs", "grid", "default_variant"}
 
     ci: list[VariantSpec] = []
     bench_cpu: list[VariantSpec] = []
@@ -444,6 +462,8 @@ def parse_spec(data: dict) -> KernelSpec:
         bench_cpu=bench_cpu,
         bench_gpu=bench_gpu,
         bench_xpu=bench_xpu,
+        outputs=outputs,
+        grid=grid,
         _named_variants=named_variants,
         default_variant=default_variant,
     )
