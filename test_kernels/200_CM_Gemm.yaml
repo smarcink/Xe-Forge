@@ -6,7 +6,7 @@ inputs:
     dtype: float16
   B:
     shape: [K, N]
-    dtype: fp16
+    dtype: float16
 
 ci:
   - params: [A, B]
