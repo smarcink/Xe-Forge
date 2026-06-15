@@ -1,0 +1,6 @@
+Linux:
+https://gfx-assets-build.intel.com/download/open-linux-driver-builds/ci/dev_igc/open-linux-driver-ci-dev_igc-20847/artifacts/linux/ubuntu/24.04/intel-igc-cm_1.0.387-1~u24.04_amd64.deb
+
+Windows:
+https://ubit-gfx.intel.com/build/17574857/overview
+Release 64 bit version
