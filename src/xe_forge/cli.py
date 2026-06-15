@@ -33,7 +33,9 @@ def _setup_dspy(config: Config) -> None:
     if config.llm.api_key:
         os.environ["OPENAI_API_KEY"] = config.llm.api_key
 
+    litellm.ssl_verify = False
     litellm.client_session = httpx.Client(verify=False)
+    litellm.aclient_session = httpx.AsyncClient(verify=False)
     lm = dspy.LM(
         model=config.llm.model,
         api_base=config.llm.api_base,
@@ -110,7 +112,7 @@ Examples:
     parser.add_argument(
         "--dsl",
         type=str,
-        choices=["triton", "gluon", "sycl", "cuda"],
+        choices=["triton", "gluon", "sycl", "cuda", "cm"],
         default=None,
         help="Kernel DSL (default: triton)",
     )
