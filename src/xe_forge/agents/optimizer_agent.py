@@ -12,6 +12,7 @@ import dspy
 
 from xe_forge.agents.base import Optimizer
 from xe_forge.agents.cover import CoVeR
+from xe_forge.core.cm_grid import describe_grid_contract
 from xe_forge.knowledge.loader import KnowledgeBase
 from xe_forge.models import (
     DSL,
@@ -464,6 +465,22 @@ class CMOptimizationSignature(dspy.Signature):
       tile to the GRF/EU budget of the target Xe device.
     DISCOVERY: apply the open-ended optimization described in the issues field.
 
+    === LAUNCH GRID & BLOCK-SIZE CONTRACT ===
+    The per-thread tile sizes are integer `#define`s that ALSO drive the launch
+    grid: the harness re-derives the global and local work sizes from them, so
+    you never set the grid yourself. The `grid_contract` input lists the EXACT
+    knob names, formulas, and current values for THIS kernel — treat it as
+    authoritative and do not assume they are called BLOCK_M/BLOCK_N.
+      - You MAY tune the #defines named in `grid_contract` for performance — the
+        dispatch grid follows their values automatically, so changing a value
+        stays correct.
+      - You MUST keep each one as a plain integer `#define <NAME> <int>` with the
+        SAME name shown in `grid_contract`. Do NOT rename it, remove it, inline
+        its literal, or turn it into a computed expression/function-like macro,
+        or grid computation fails and the kernel is rejected.
+      - Keep cm_group_id(...) tile indexing consistent with these block sizes
+        (each thread owns one tile sized by these #defines).
+
     === CODE REQUIREMENTS ===
     - Must be complete, valid CM C++ with all required #include directives
       (e.g. <cm/cm.h> or <cm/cmtl.h>)
@@ -497,6 +514,10 @@ class CMOptimizationSignature(dspy.Signature):
         "Empty if KB disabled. Follow the patterns and constraints precisely — "
         "they are validated optimizations for Intel Xe GPUs."
     )
+    grid_contract: str = dspy.InputField(
+        desc="Launch-grid contract: the exact integer #define knobs that drive the "
+        "dispatch grid, their current values, and the rule against renaming them."
+    )
     optimized_code: dspy.Code["cpp"] = dspy.OutputField(
         desc="Complete optimized CM C++ kernel. Must include all #includes and the _GENX_MAIN_ entry point."
     )
@@ -526,6 +547,14 @@ class CMAlgorithmicOptimizationSignature(dspy.Signature):
     4. Memory access / layout optimization (coalesced LSC 2D block reads, SLM reuse)
     5. Batch dimension exploitation
 
+    === LAUNCH GRID & BLOCK-SIZE CONTRACT ===
+    The per-thread tile sizes are integer `#define`s that ALSO drive the launch
+    grid; the harness re-derives the work sizes from them. The `grid_contract`
+    input lists the EXACT knob names and current values for THIS kernel. If a
+    rewrite changes tiling you MAY tune those values, but keep each knob a plain
+    integer `#define <NAME> <int>` with the SAME name — do NOT rename, remove,
+    inline, or compute it, or the kernel is rejected.
+
     === CODE REQUIREMENTS ===
     - Must be complete, valid CM C++ with all required #include directives
       (e.g. <cm/cm.h> or <cm/cmtl.h>)
@@ -550,6 +579,10 @@ class CMAlgorithmicOptimizationSignature(dspy.Signature):
     knowledge_base_context: str = dspy.InputField(
         desc="Relevant algorithmic patterns and examples from the knowledge base. "
         "Empty if KB disabled. Follow these patterns precisely."
+    )
+    grid_contract: str = dspy.InputField(
+        desc="Launch-grid contract: the exact integer #define knobs that drive the "
+        "dispatch grid, their current values, and the rule against renaming them."
     )
     optimized_code: dspy.Code["cpp"] = dspy.OutputField(
         desc="Complete optimized CM C++ kernel with algorithmic improvements."
@@ -854,6 +887,7 @@ class OptimizerAgent(Optimizer):
         kernel_name=None,
         input_shapes=None,
         spec_dims=None,
+        grid_spec=None,
         flop=None,
         dtype=None,
         pytorch_code="",
@@ -960,6 +994,10 @@ class OptimizerAgent(Optimizer):
                     "vtune_report": vtune_report or "",
                     "knowledge_base_context": kb_context,
                 }
+            if self.dsl == DSL.CM:
+                # Name the real grid-driving #defines (from the known-good original)
+                # so the agent tunes their values without renaming the dispatch knobs.
+                kwargs["grid_contract"] = describe_grid_contract(grid_spec, original_code)
         elif stage == OptimizationStage.ALGORITHMIC:
             sig = AlgorithmicOptimizationSignature
             kwargs = {

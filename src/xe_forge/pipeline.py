@@ -194,6 +194,7 @@ class XeForgePipeline:
         import torch
 
         spec, flop, dtype, init_args, spec_dims, input_dtypes = None, None, None, None, None, None
+        spec_grid = None
         if spec_path:
             from xe_forge.core.spec_loader import load_spec
 
@@ -205,12 +206,16 @@ class XeForgePipeline:
             dtype = spec.get_dtype(variant_type)
             input_dtypes = spec.get_input_dtypes(variant_type)
             init_args = spec.get_init_args(variant_type)
+            spec_grid = spec.grid
             logger.info(
                 f"Loaded spec: variant={variant_type}, shapes={input_shapes}, "
                 f"dims={spec_dims}, flop={flop}, dtype={dtype}"
             )
             if init_args:
                 logger.info(f"  Model init args: {init_args}")
+
+            if hasattr(self.executor, "grid_spec"):
+                self.executor.grid_spec = spec.grid
 
         ertol, eatol = self._resolve_tolerances(spec, variant_type, rtol, atol)
         if hasattr(self.executor, "rtol"):
@@ -390,6 +395,7 @@ class XeForgePipeline:
                     kernel_name=kernel_name,
                     input_shapes=input_shapes,
                     spec_dims=spec_dims,
+                    grid_spec=spec_grid,
                     flop=flop,
                     dtype=dtype,
                     pytorch_code=reference_code,

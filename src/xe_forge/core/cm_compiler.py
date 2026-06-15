@@ -191,32 +191,6 @@ class CMCompiler:
         logger.info("Compiled CM kernel -> %s", out_path)
         return out_path
 
-    def compute_grid(
-        self,
-        kernel_source: str,
-        grid_spec: dict | None,
-        dims: dict[str, int | float] | None = None,
-    ) -> GridConfig:
-        """Compute grid configuration from kernel source and grid specification.
-
-        Args:
-            kernel_source: The full CM kernel C++ source (to extract #defines).
-            grid_spec: Grid spec from YAML (e.g., {"x": "ceil(M/BLOCK_M)", "y": ...}).
-            dims: Problem dimensions for this variant (e.g., {"M": 1024, ...}).
-
-        Returns:
-            GridConfig with concrete global/local work sizes.
-
-        Raises:
-            ValueError: If grid can't be computed (missing #defines, bad expressions).
-        """
-        from xe_forge.core.cm_grid import parse_grid_from_kernel_and_spec
-
-        dims = dims or {}
-        # Ensure dims are ints (may come as floats from CLI)
-        dims_int = {k: int(v) for k, v in dims.items()}
-        return parse_grid_from_kernel_and_spec(kernel_source, grid_spec, dims_int)
-
     def run(
         self,
         binary: str | Path,
@@ -225,20 +199,25 @@ class CMCompiler:
         verify: int = 0,
         input_dir: str | None = None,
         output_dir: str | None = None,
+        grid: GridConfig | None = None,
     ) -> CMRunResult:
         """Run a compiled CM kernel and parse its timing output — STUB.
 
         ``dims`` is a generic name->int map (e.g. ``{"M": .., "N": .., "K": ..}``
         for a GEMM, but any kernel's shape parameters) passed to the host harness
-        as CLI args. ``input_dir`` (when given) holds the shared input tensors the
-        harness binds as STATEFUL buffers (``input_0.bin``, ``input_1.bin``, ...);
+        as CLI args. ``grid`` is the concrete launch geometry resolved by
+        :func:`xe_forge.core.cm_grid.compute_grid` from the kernel's ``#define``
+        block sizes; the harness binds it as the ND-range / work-group size.
+        ``input_dir`` (when given) holds the shared input tensors the harness
+        binds as STATEFUL buffers (``input_0.bin``, ``input_1.bin``, ...);
         ``output_dir`` is where it dumps the result (``output_0.bin``) for
         external correctness comparison. When ``input_dir`` is set, ``verify`` is
         typically 0 because correctness is checked in Python against those dumps.
 
-        TODO(cm): execute the host harness with the given dims and iteration
-        count, loading inputs from ``input_dir`` and dumping
+        TODO(cm): execute the host harness with the given dims, iteration count,
+        and ``grid.global_size`` / ``grid.local_size`` (written into the launch
+        manifest), loading inputs from ``input_dir`` and dumping
         ``output_dir/output_0.bin``, parse "<tflops> TFlop/s (<ms>) ms", and
         return timing.
         """
-        return CMRunResult(success=False, error=_STUB_REASON)
+        return CMRunResult(success=False, error=_STUB_REASON, grid=grid)

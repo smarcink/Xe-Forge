@@ -12,6 +12,7 @@ from collections.abc import Callable
 import dspy
 
 from xe_forge.agents.base import Optimizer
+from xe_forge.core.cm_grid import describe_grid_contract
 from xe_forge.knowledge.patterns import get_stage_for_issue
 
 try:
@@ -251,6 +252,22 @@ class CMOptimizationReActSignature(dspy.Signature):
        acc; avoid double
     6. Unroll tight, compile-time-bounded loops with #pragma unroll
 
+    === LAUNCH GRID & BLOCK-SIZE CONTRACT ===
+    The per-thread tile sizes are integer `#define`s that ALSO drive the launch
+    grid: the harness re-derives the global and local work sizes from them, so
+    you never set the grid yourself. The `grid_contract` input lists the EXACT
+    knob names, formulas, and current values for THIS kernel — treat it as
+    authoritative and do not assume they are called BLOCK_M/BLOCK_N.
+      - You MAY tune the #defines named in `grid_contract` for performance — the
+        dispatch grid follows their values automatically, so changing a value
+        stays correct.
+      - You MUST keep each one as a plain integer `#define <NAME> <int>` with the
+        SAME name shown in `grid_contract`. Do NOT rename it, remove it, inline
+        its literal, or turn it into a computed expression/function-like macro,
+        or grid computation fails and the kernel is rejected.
+      - Keep cm_group_id(...) tile indexing consistent with these block sizes
+        (each thread owns one tile sized by these #defines).
+
     === CODE REQUIREMENTS ===
     - Complete, valid CM C++ with all required #include directives
       (e.g. <cm/cm.h> or <cm/cmtl.h>)
@@ -266,6 +283,10 @@ class CMOptimizationReActSignature(dspy.Signature):
     issues: list[DetectedIssue] = dspy.InputField(desc="Specific issues to fix in this stage")
     knowledge_patterns: str = dspy.InputField(desc="Optimization patterns and examples to follow")
     xpu_config: str = dspy.InputField(desc="Intel GPU configuration parameters")
+    grid_contract: str = dspy.InputField(
+        desc="Launch-grid contract: the exact integer #define knobs that drive the "
+        "dispatch grid, their current values, and the rule against renaming them."
+    )
 
     optimized_code: dspy.Code[cpp] = dspy.OutputField(
         desc="Complete optimized CM C++ kernel with all #includes and the _GENX_MAIN_ entry point."
@@ -435,6 +456,7 @@ class OptimizerReActAgent(Optimizer):
         kernel_name: str | None = None,
         input_shapes: list[tuple[int, ...]] | None = None,
         spec_dims: dict[str, int] | None = None,
+        grid_spec: dict | None = None,
         flop: float | None = None,
         dtype=None,
         pytorch_code: str = "",
@@ -519,14 +541,20 @@ class OptimizerReActAgent(Optimizer):
         try:
             logger.info(f"Starting ReAct optimization (max {self.max_iterations} iterations)")
 
-            result = react_agent(
-                original_code=original_code,
-                current_code=code,
-                stage=stage.value,
-                issues=stage_issues,
-                knowledge_patterns=knowledge_patterns,
-                xpu_config=xpu_config_text,
-            )
+            react_kwargs = {
+                "original_code": original_code,
+                "current_code": code,
+                "stage": stage.value,
+                "issues": stage_issues,
+                "knowledge_patterns": knowledge_patterns,
+                "xpu_config": xpu_config_text,
+            }
+            if self.dsl == DSL.CM:
+                # Name the real grid-driving #defines (from the known-good original)
+                # so the agent tunes them without renaming the dispatch knobs.
+                react_kwargs["grid_contract"] = describe_grid_contract(grid_spec, original_code)
+
+            result = react_agent(**react_kwargs)
 
             # Extract optimized code from result
             if not hasattr(result, "optimized_code") or result.optimized_code is None:

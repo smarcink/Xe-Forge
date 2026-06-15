@@ -26,7 +26,7 @@ import torch
 from ai_bench.harness.runner.benchmark_compare import set_all_seeds
 
 from xe_forge.core.cm_compiler import CM_ROOT, CMCompiler, CMRunResult
-from xe_forge.core.cm_grid import GridConfig
+from xe_forge.core.cm_grid import compute_grid
 from xe_forge.core.sycl_executor import KernelType, _save_tensor
 from xe_forge.models import ExecutionResult
 
@@ -240,6 +240,7 @@ class CMExecutor:
         )
         self.iterations = iterations
         self.verify = verify
+        self.grid_spec: dict | None = None
         self._build_dir: str | None = None
         self._cached_input_dir: str | None = None
         self._cached_input_key: tuple | None = None
@@ -276,27 +277,6 @@ class CMExecutor:
             return False, "", err
         logger.info("Compilation succeeded: %s", binary)
         return True, str(binary), ""
-
-    def compute_grid(
-        self,
-        kernel_source: str,
-        grid_spec: dict | None,
-        dims: dict[str, int | float] | None = None,
-    ) -> GridConfig:
-        """Compute grid configuration from kernel source and grid specification.
-
-        Args:
-            kernel_source: The full CM kernel C++ source (to extract #defines).
-            grid_spec: Grid spec from YAML (e.g., {"x": "ceil(M/BLOCK_M)", "y": ...}).
-            dims: Problem dimensions for this variant (e.g., {"M": 1024, ...}).
-
-        Returns:
-            GridConfig with concrete global/local work sizes.
-
-        Raises:
-            ValueError: If grid can't be computed (missing #defines, bad expressions).
-        """
-        return self._compiler.compute_grid(kernel_source, grid_spec, dims)
 
     @staticmethod
     def _gemm_specs_from_dims(
@@ -414,6 +394,13 @@ class CMExecutor:
 
         effective_dims = dims or {"M": m, "N": n, "K": k}
         logger.info("Running CM kernel: %s (dims=%s)", binary_path, effective_dims)
+
+        kernel_source = kernel_code if kernel_code is not None else Path(kernel_path).read_text()
+        try:
+            grid = compute_grid(kernel_source, self.grid_spec, effective_dims)
+        except ValueError as e:
+            return ExecutionResult(success=False, error_message=f"Grid computation failed: {e}")
+
         # Skip the harness's internal verify when using file-based I/O — we
         # compare the dumped outputs in Python via compare_outputs() instead.
         use_verify = 0 if input_dir else (1 if self.verify else 0)
@@ -426,6 +413,7 @@ class CMExecutor:
             verify=use_verify,
             input_dir=input_dir,
             output_dir=output_dir,
+            grid=grid,
         )
         return self._to_execution_result(result)
 

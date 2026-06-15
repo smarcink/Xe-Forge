@@ -4,27 +4,31 @@ Test grid parsing and evaluation for CM kernels.
 
 from pathlib import Path
 
-from xe_forge.core.cm_grid import GridParser, parse_grid_from_kernel_and_spec
+from xe_forge.core.cm_grid import (
+    _check_symbols,
+    _safe_eval,
+    compute_grid,
+    describe_grid_contract,
+    extract_defines,
+)
 from xe_forge.core.spec_loader import load_spec
 
 
 def test_grid_parser_basic():
     """Test basic grid expression parsing with ceil, min, max."""
-    parser = GridParser()
-
     # Test simple division with ceil
-    result = parser._safe_eval("ceil(256 / 8)", {})
+    result = _safe_eval("ceil(256 / 8)", {})
     assert result == 32, f"Expected 32, got {result}"
 
     # Test with context variables
-    result = parser._safe_eval("ceil(M / BLOCK_M)", {"M": 256, "BLOCK_M": 8})
+    result = _safe_eval("ceil(M / BLOCK_M)", {"M": 256, "BLOCK_M": 8})
     assert result == 32, f"Expected 32, got {result}"
 
     # Test min/max
-    result = parser._safe_eval("min(256, 512)", {})
+    result = _safe_eval("min(256, 512)", {})
     assert result == 256, f"Expected 256, got {result}"
 
-    result = parser._safe_eval("max(8, 16)", {})
+    result = _safe_eval("max(8, 16)", {})
     assert result == 16, f"Expected 16, got {result}"
 
     print("[OK] Basic grid parser tests passed")
@@ -44,8 +48,7 @@ cm_gemm(SurfaceIndex A, int M, int N) {
   // kernel body
 }
 """
-    parser = GridParser()
-    defines = parser.extract_defines(kernel_source)
+    defines = extract_defines(kernel_source)
 
     assert defines == {"BLOCK_M": 8, "BLOCK_N": 16, "BLOCK_K": 32}, f"Got {defines}"
     print("[OK] Define extraction test passed")
@@ -53,21 +56,19 @@ cm_gemm(SurfaceIndex A, int M, int N) {
 
 def test_validate_references():
     """Test symbol validation."""
-    parser = GridParser()
-
     dims = {"M": 256, "N": 256, "K": 256}
     defines = {"BLOCK_M": 8, "BLOCK_N": 16}
 
     # Valid expression
     try:
-        parser.validate_references("ceil(M / BLOCK_M)", dims, defines)
+        _check_symbols("ceil(M / BLOCK_M)", dims, defines, "grid")
         print("[OK] Valid reference check passed")
     except ValueError as e:
         raise AssertionError(f"Valid expression rejected: {e}") from e
 
     # Invalid expression (missing BLOCK_K)
     try:
-        parser.validate_references("ceil(K / BLOCK_K)", dims, defines)
+        _check_symbols("ceil(K / BLOCK_K)", dims, defines, "grid")
         raise AssertionError("Should have rejected missing BLOCK_K")
     except ValueError as e:
         assert "BLOCK_K" in str(e), f"Expected BLOCK_K in error, got: {e}"
@@ -76,8 +77,7 @@ def test_validate_references():
 
 def test_define_extraction_hex():
     """Hex/oct/bin #define values are parsed, function-like macros are skipped."""
-    parser = GridParser()
-    defines = parser.extract_defines(
+    defines = extract_defines(
         "#define BLOCK_M 0x10\n"
         "#define BLOCK_N 8  // trailing comment\n"
         "#define SQUARE(x) ((x)*(x))\n"
@@ -88,10 +88,9 @@ def test_define_extraction_hex():
 
 def test_unsafe_expression_rejected():
     """The evaluator must reject power operators and arbitrary calls (no eval())."""
-    parser = GridParser()
     for bad in ["9 ** 9 ** 9", "__import__('os')", "M.__class__", "open('x')"]:
         try:
-            parser._safe_eval(bad, {"M": 256})
+            _safe_eval(bad, {"M": 256})
             raise AssertionError(f"Should have rejected unsafe expression: {bad!r}")
         except ValueError:
             pass
@@ -103,7 +102,7 @@ def test_missing_symbol_diagnostic():
     kernel_source = "#define BLOCK_M 8\n"  # BLOCK_N intentionally absent
     grid_spec = {"x": "ceil(M / BLOCK_M)", "y": "ceil(N / BLOCK_N)", "z": 1}
     try:
-        parse_grid_from_kernel_and_spec(kernel_source, grid_spec, {"M": 256, "N": 256})
+        compute_grid(kernel_source, grid_spec, {"M": 256, "N": 256})
         raise AssertionError("Should have rejected missing BLOCK_N")
     except ValueError as e:
         msg = str(e)
@@ -111,6 +110,27 @@ def test_missing_symbol_diagnostic():
         # The message must distinguish kernel #defines (BLOCK_M present) from dims.
         assert "BLOCK_M" in msg and "#define" in msg, f"Diagnostic not actionable: {msg}"
         print("[OK] Missing-symbol diagnostic test passed")
+
+
+def test_grid_contract_names_actual_knobs():
+    """The prompt contract lists the real knob names from the formula, not hardcoded ones."""
+    # Custom knob names (not BLOCK_*) to prove extraction is name-agnostic.
+    kernel_source = "#define TILE_ROWS 16\n#define TILE_COLS 32\n"
+    grid_spec = {"x": "ceil(M / TILE_ROWS)", "y": "ceil(N / TILE_COLS)", "z": 1}
+    contract = describe_grid_contract(grid_spec, kernel_source)
+
+    assert "TILE_ROWS = 16" in contract, contract
+    assert "TILE_COLS = 32" in contract, contract
+    # Problem dims are reported as fixed, not as tunable knobs.
+    assert "M, N" in contract, contract
+    # Hardening language must be present.
+    assert "do NOT rename" in contract, contract
+
+    # No grid_spec -> default BLOCK_M/BLOCK_N contract from the kernel's defines.
+    default_contract = describe_grid_contract(None, "#define BLOCK_M 8\n#define BLOCK_N 16\n")
+    assert "BLOCK_M = 8" in default_contract, default_contract
+    assert "BLOCK_N = 16" in default_contract, default_contract
+    print("[OK] Grid contract knob-naming test passed")
 
 
 
@@ -142,7 +162,7 @@ cm_gemm(SurfaceIndex surfA [[type("buffer_t")]],
 
     dims = {"M": 256, "N": 256, "K": 256}
 
-    grid = parse_grid_from_kernel_and_spec(kernel_source, grid_spec, dims)
+    grid = compute_grid(kernel_source, grid_spec, dims)
 
     # For 256x256 with BLOCK_M=8, BLOCK_N=16:
     # x = ceil(256 / 8) = 32
@@ -196,6 +216,7 @@ if __name__ == "__main__":
     test_define_extraction_hex()
     test_unsafe_expression_rejected()
     test_missing_symbol_diagnostic()
+    test_grid_contract_names_actual_knobs()
     test_grid_config_from_seed_kernel()
     test_load_spec_with_grid_and_outputs()
     print("\nAll grid tests passed!")
