@@ -414,6 +414,23 @@ class CMOptimizationSignature(dspy.Signature):
     equivalent outputs. You may change SIMD width, register tiling, memory
     access patterns, SLM usage, and DPAS configuration.
 
+    === CM EXECUTION MODEL (explicit SIMD — READ FIRST) ===
+    CM is an EXPLICIT-SIMD language, NOT a SIMT one (unlike CUDA/Triton/Gluon).
+    You do NOT write the body for a single scalar lane. Instead you write ONE
+    thread that operates directly on whole vector<>/matrix<> objects, and the
+    SIMD lanes ARE the elements of those operands.
+      - "1 thread" == the whole SIMD vector == a warp/subgroup of work. It is
+        NOT one lane. Launching 1 thread launches 1 SIMD vector, not 1 lane.
+      - There is no lane-count #define; SIMD width is chosen per instruction by
+        the operand width — widen vector<>/matrix<> operands to get wider SIMD.
+      - cm_global_id / cm_local_id / cm_group_id index THREADS (which tile of
+        work this thread owns), NOT lanes. Compute the tile, then process it
+        with vector/matrix ops.
+      - Express data parallelism via operand WIDTH and per-thread tile size
+        (bounded by the GRF), never by spawning scalar threads.
+      - Per-element divergent control flow uses the SIMD_IF_BEGIN/... macros
+        (SIMD width a power of two in 2..32); scalar control flow is uniform.
+
     === CM OPTIMIZATION KNOBS ===
     - SIMD width: chosen per-instruction by the compiler and driven by operand
       width — widen vector<>/matrix<> operands to get wider SIMD; there is no
@@ -493,6 +510,14 @@ class CMAlgorithmicOptimizationSignature(dspy.Signature):
 
     Transform the kernel to perform FEWER FLOPs and/or FEWER memory accesses
     while producing numerically equivalent results.
+
+    === CM EXECUTION MODEL (explicit SIMD) ===
+    CM is EXPLICIT-SIMD, NOT SIMT (unlike CUDA/Triton/Gluon). One thread
+    operates on whole vector<>/matrix<> objects and the SIMD lanes ARE the
+    elements of those operands. "1 thread" == the whole SIMD vector (a
+    warp/subgroup of work), NOT one lane; cm_global_id/cm_local_id/cm_group_id
+    index THREADS (tiles of work), not lanes. Keep algebraic rewrites operating
+    on vector/matrix operands — do not scalarize into per-lane code.
 
     Think about:
     1. Matrix structure exploitation (symmetric, triangular, diagonal, low-rank)

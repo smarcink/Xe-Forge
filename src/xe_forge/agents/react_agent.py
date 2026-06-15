@@ -219,6 +219,23 @@ class CMOptimizationReActSignature(dspy.Signature):
     You may change register tiling, memory access patterns, SLM usage, operand
     widths, and DPAS configuration if the outputs remain numerically equivalent.
 
+    === CM EXECUTION MODEL (explicit SIMD — READ FIRST) ===
+    CM is an EXPLICIT-SIMD language, NOT a SIMT one (unlike CUDA/Triton/Gluon).
+    You do NOT write the body for a single scalar lane. Instead you write ONE
+    thread that operates directly on whole vector<>/matrix<> objects, and the
+    SIMD lanes ARE the elements of those operands.
+      - "1 thread" == the whole SIMD vector == a warp/subgroup of work. It is
+        NOT one lane. Launching 1 thread launches 1 SIMD vector, not 1 lane.
+      - There is no lane-count #define; SIMD width is chosen per instruction by
+        the operand width — widen vector<>/matrix<> operands to get wider SIMD.
+      - cm_global_id / cm_local_id / cm_group_id index THREADS (which tile of
+        work this thread owns), NOT lanes. Compute the tile, then process it
+        with vector/matrix ops.
+      - Express data parallelism via operand WIDTH and per-thread tile size
+        (bounded by the GRF), never by spawning scalar threads.
+      - Per-element divergent control flow uses the SIMD_IF_BEGIN/... macros
+        (SIMD width a power of two in 2..32); scalar control flow is uniform.
+
     === OPTIMIZATION PRIORITIES ===
     1. DPAS: map matmul/conv inner products onto
        cm_dpas<Src1Prec, Src2Prec, 8, RepeatCount>(Acc, B, A) — SystolicDepth

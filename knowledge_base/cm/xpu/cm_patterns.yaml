@@ -6,6 +6,56 @@
 # device_specific, autotuning, discovery).
 
 patterns:
+  - id: cm_explicit_simd_model
+    name: "CM is explicit SIMD: one thread is a whole SIMD vector (a 'warp'), not one lane"
+    stage: device_specific
+    before: |
+      // WRONG mental model (SIMT / CUDA / Triton): treating the kernel body as
+      // the code for ONE scalar lane and relying on the hardware to run many
+      // such lanes in lock-step. CM does NOT work this way — there is no
+      // implicit per-lane execution, no threadIdx.x lane id, and no warp of
+      // scalar threads to index into.
+      int lane = cm_local_id(0);     // NOT a SIMD lane index
+      float x = a[lane] * b[lane];   // scalars: wastes the EU, emits SIMD1 ops
+    after: |
+      // CORRECT mental model (explicit SIMD): you write ONE thread that
+      // explicitly operates on whole vector<>/matrix<> objects. The SIMD lanes
+      // ARE the elements of those operands — the compiler maps an op on a
+      // vector<float,N> to a SIMD-N instruction across the EU's channels.
+      //   * One CM "thread" == one hardware thread == the whole SIMD vector
+      //     (the analogue of a CUDA/Triton "warp"/program), NOT one lane.
+      //   * Launching 1 thread launches 1 SIMD vector of work, NOT 1 scalar lane.
+      //   * Per-thread global/local ids (cm_global_id / cm_local_id /
+      //     cm_group_id) pick which TILE this thread owns, not which lane.
+      //   * Data parallelism is expressed by operand WIDTH, not by spawning
+      //     scalar threads: widen vector<>/matrix<> to get wider SIMD.
+      vector<float, 32> va = cm_load<float, 32>(a_surf, tile_byte_offset);
+      vector<float, 32> vb = cm_load<float, 32>(b_surf, tile_byte_offset);
+      vector<float, 32> vx = va * vb;   // one SIMD32 multiply across 32 channels
+    description: |
+      C for Metal is an EXPLICIT-SIMD language, unlike SIMT models such as CUDA,
+      Triton or Gluon. In SIMT you write the code for a single scalar lane and
+      the hardware implicitly replicates it across a warp/subgroup. In CM you
+      instead write a single thread that operates directly on vector<> / matrix<>
+      data, and the SIMD lanes are the elements of those vectors/matrices.
+      Key consequences the optimizer MUST keep in mind:
+        - "1 thread" == the whole SIMD vector == a warp/subgroup-equivalent of
+          work. It is NOT one lane. Launching N threads launches N SIMD vectors.
+        - There is no lane-count #define and no per-lane scalar kernel body;
+          SIMD width is chosen per instruction by the operand width (see
+          cm_simd_width). Wider vector<>/matrix<> operands => wider SIMD.
+        - cm_global_id / cm_local_id / cm_group_id index THREADS (i.e. tiles of
+          work), not lanes. Use them to compute which output tile this thread
+          owns, then process that tile with vector/matrix ops.
+        - Sizing per-thread vector<>/matrix<> tiles to the GRF budget is how you
+          control occupancy and SIMD utilization — not by changing a lane count.
+        - Divergent per-element control flow uses SIMD control flow macros
+          (SIMD_IF_BEGIN/…); the SIMD width of such a block must be a power of
+          two in 2..32. Scalar control flow is uniform across all channels.
+    rationale: "Reasoning about CM as if it were SIMT (one scalar lane per thread) produces SIMD1 scalar code that idles the EU; the correct explicit-SIMD model maps vector/matrix operands directly onto wide SIMD instructions."
+    expected_speedup: "Foundational — prevents scalarized kernels that run many times slower than vectorized SIMD code"
+    applies_to: [gemm, matmul, conv, reduction, elementwise, any]
+
   - id: cm_dpas_matmul
     name: "Use the DPAS (XMX) systolic array for the matmul inner product"
     stage: device_specific
