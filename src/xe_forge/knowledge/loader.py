@@ -93,6 +93,7 @@ class KnowledgeEntry:
     prerequisites: list[str] = field(default_factory=list)
     notes: str = ""
     examples: list[dict] = field(default_factory=list)
+    requires: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -284,6 +285,7 @@ def load_knowledge_base(
     knowledge_dir: str | Path,
     dsl: str = "triton",
     device_type: str = "xpu",
+    capabilities: dict[str, bool] | None = None,
 ) -> KnowledgeBase:
     kb = KnowledgeBase()
     kp = Path(knowledge_dir)
@@ -298,7 +300,7 @@ def load_knowledge_base(
         return kb
 
     for yf in yaml_files:
-        _load_yaml_file(kb, yf)
+        _load_yaml_file(kb, yf, capabilities)
 
     for examples_dir in _collect_examples_dirs(kp, dsl, device_type):
         _load_examples(kb, examples_dir)
@@ -356,7 +358,7 @@ def _collect_examples_dirs(kp: Path, dsl: str, device_type: str) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
-def _load_yaml_file(kb: KnowledgeBase, path: Path) -> None:
+def _load_yaml_file(kb: KnowledgeBase, path: Path, capabilities: dict[str, bool] | None = None) -> None:
     try:
         with open(path) as f:
             data = yaml.safe_load(f)
@@ -378,6 +380,13 @@ def _load_yaml_file(kb: KnowledgeBase, path: Path) -> None:
         if not isinstance(raw, dict):
             continue
         entry = _parse_entry(raw, fname)
+        if entry and not _requirements_met(entry.requires, capabilities):
+            logger.info(
+                "KB: skipping pattern %r — target device lacks required capability %s",
+                entry.id,
+                entry.requires,
+            )
+            continue
         if entry:
             kb.add_entry(entry)
         else:
@@ -389,6 +398,17 @@ def _load_yaml_file(kb: KnowledgeBase, path: Path) -> None:
                     "stage": raw.get("stage", "?"),
                 }
             )
+
+
+def _requirements_met(requires: list[str], capabilities: dict[str, bool] | None) -> bool:
+    """True unless a required capability is explicitly reported as unavailable.
+
+    Unknown requirements / missing capability info default to True so patterns
+    are only dropped when we positively know the device lacks the feature.
+    """
+    if not requires or not capabilities:
+        return True
+    return all(capabilities.get(req, True) for req in requires)
 
 
 def _parse_constraint(data: dict, source: str) -> KnowledgeConstraint | None:
@@ -444,6 +464,7 @@ def _parse_entry(data: dict, source: str) -> KnowledgeEntry | None:
         prerequisites=data.get("prerequisites", []),
         notes=str(data.get("notes", "")),
         examples=data.get("examples", []),
+        requires=data.get("requires", []),
     )
 
 

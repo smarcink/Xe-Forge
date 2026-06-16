@@ -91,6 +91,7 @@ class XeForgePipeline:
                 self.config.knowledge.knowledge_dir,
                 dsl=self.config.device_config.dsl,
                 device_type=self.config.device_config.device,
+                capabilities=self._detect_kb_capabilities(),
             )
             logger.info("  Knowledge base: %s", self.knowledge_base.summary())
         else:
@@ -125,6 +126,25 @@ class XeForgePipeline:
         logger.info(
             f"  Agent: {self.config.agent.strategy} (max_iters={self.config.agent.max_iterations})"
         )
+
+    def _detect_kb_capabilities(self) -> dict[str, bool] | None:
+        """Device feature flags used to gate capability-specific KB patterns.
+
+        Returns ``{"xmx": ...}`` from the live Intel GPU so patterns tagged
+        ``requires: [xmx]`` are dropped on hardware that lacks it (e.g. Xe-LPG /
+        Meteor Lake / Arrow Lake have no XMX). Returns ``None`` (no gating) for
+        non-XPU devices or when the query fails, preserving prior behavior.
+        """
+        if self.config.device_config.device != "xpu":
+            return None
+        try:
+            from xe_forge.core.xpu_query import get_xpu_config
+
+            hw = get_xpu_config()
+            return {"xmx": hw.has_xmx}
+        except Exception as e:
+            logger.debug("KB capability detection failed: %s", e)
+            return None
 
     def _setup_logging(self):
         log_level = getattr(logging, self.config.logging.level.upper(), logging.INFO)

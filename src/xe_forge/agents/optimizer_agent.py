@@ -442,9 +442,9 @@ class CMOptimizationSignature(dspy.Signature):
     - Register tiles: vector<T,N> / matrix<T,R,C> sized to the GRF budget
     - SLM staging: cm_slm_init + cm_slm_alloc, move tiles with LSC SLM ops
       (cm_store_slm / cm_load_slm), sync with cm_slm_fence + cm_barrier
-    - LSC block loads: cm_load<T,NElts,...>(surf, byte_offset) (1D) or a
-      lsc::block_2d_desc with cm_load LoadOp::Normal/Transpose/VNNI (2D) for
-      coalesced HBM access; VNNI-transform lays out the DPAS B matrix
+    - LSC block loads: cm_load<T,NElts,...>(surf, byte_offset) (1D) for
+      coalesced HBM access; build register tiles from several contiguous 1D
+      row loads
     - Thread space: cm_group_id, cm_local_id, cm_linear_global_id partitioning
     - Loop unrolling: #pragma unroll on the K loop
     - Prefetch: cm_prefetch to hide HBM latency
@@ -458,7 +458,7 @@ class CMOptimizationSignature(dspy.Signature):
       int32 accumulators); avoid double.
     FUSION: fuse elementwise post-ops (bias, activation, scale, clamp) into the
       producing kernel before the store — applies to ANY kernel, not just GEMM.
-    MEMORY_ACCESS: use LSC 1D/2D block loads, stage reused tiles through SLM,
+    MEMORY_ACCESS: use LSC 1D block loads, stage reused tiles through SLM,
       add cm_prefetch.
     DEVICE_SPECIFIC: map matmul/conv inner loops onto DPAS (SystolicDepth=8),
       widen operands so the compiler emits wider SIMD, and size the per-thread
@@ -544,7 +544,7 @@ class CMAlgorithmicOptimizationSignature(dspy.Signature):
     1. Matrix structure exploitation (symmetric, triangular, diagonal, low-rank)
     2. Associative / distributive law rewrites to reduce FLOPs
     3. Common sub-expression elimination and loop-invariant hoisting
-    4. Memory access / layout optimization (coalesced LSC 2D block reads, SLM reuse)
+    4. Memory access / layout optimization (coalesced LSC 1D block reads, SLM reuse)
     5. Batch dimension exploitation
 
     === LAUNCH GRID & BLOCK-SIZE CONTRACT ===

@@ -41,6 +41,7 @@ class XPUDeviceInfo:
     has_fp64: bool = False
     has_fp16: bool = True
     has_bf16: bool = False
+    has_xmx: bool = True
 
     # Recommended kernel parameters
     recommended_num_warps: int = 32
@@ -99,6 +100,8 @@ def query_xpu_via_torch() -> XPUDeviceInfo | None:
                 info.has_fp64 = props.has_fp64
             if hasattr(props, "has_fp16"):
                 info.has_fp16 = props.has_fp16
+            if hasattr(props, "has_subgroup_matrix_multiply_accumulate"):
+                info.has_xmx = bool(props.has_subgroup_matrix_multiply_accumulate)
 
             # Store raw properties
             for attr in dir(props):
@@ -340,6 +343,7 @@ def get_xpu_config_dict(device_id: int = 0) -> dict[str, Any]:
         "has_fp16": info.has_fp16,
         "has_bf16": info.has_bf16,
         "has_fp64": info.has_fp64,
+        "has_xmx": info.has_xmx,
     }
 
 
@@ -763,6 +767,7 @@ def get_xpu_config_for_pipeline(
             params["has_fp16"] = hw_info.has_fp16
             params["has_bf16"] = hw_info.has_bf16
             params["has_fp64"] = hw_info.has_fp64
+            params["has_xmx"] = hw_info.has_xmx
 
             return params
 
@@ -795,6 +800,31 @@ def get_xpu_config_for_pipeline(
         )
 
     return hw_config
+
+
+def format_device_capabilities_for_llm(has_xmx: bool = True) -> str:
+    """Render device matrix capabilities + hard constraints for prompts.
+
+    Shared by the optimizer config text and the analyzer problem context so the
+    wording stays identical. ``has_xmx`` defaults to True (capable): a host where
+    the device could not be queried preserves prior behavior, and a DO-NOT
+    directive is emitted only when the engine is explicitly absent (e.g. Xe-LPG /
+    Meteor Lake / Arrow Lake have no XMX systolic array).
+    """
+    lines = [
+        "DEVICE CAPABILITIES:",
+        f"  XMX/DPAS systolic matmul: {'available' if has_xmx else 'NOT AVAILABLE'}",
+    ]
+    if not has_xmx:
+        lines.append("")
+        lines.append("HARD CONSTRAINTS (the target GPU lacks the feature below):")
+        lines.append(
+            "  - NO XMX/DPAS matrix engine: do NOT suggest or emit DPAS/XMX matmul "
+            "intrinsics (e.g. cm_dpas in CM, or tl.dot paths that assume XMX). "
+            "Implement matmul inner products with vector FMA (float/half) or dp4a "
+            "(int8); accumulate in float/int32."
+        )
+    return "\n".join(lines)
 
 
 def format_xpu_config_for_llm(xpu_config: dict[str, Any]) -> str:
@@ -841,6 +871,13 @@ def format_xpu_config_for_llm(xpu_config: dict[str, Any]) -> str:
         if xpu_config.get("global_mem_gb"):
             lines.append(f"  Memory: {xpu_config['global_mem_gb']:.1f} GB")
 
+    # Device capability constraints (XMX/DPAS). Rendered by a shared helper so
+    # the analyzer prompt reuses the exact same wording.
+    cap_text = format_device_capabilities_for_llm(xpu_config.get("has_xmx", True))
+    if cap_text:
+        lines.append("")
+        lines.append(cap_text)
+
     return "\n".join(lines)
 
 
@@ -871,6 +908,7 @@ def print_xpu_info(device_id: int = 0):
     print(f"  FP16:              {'Yes' if info.has_fp16 else 'No'}")
     print(f"  BF16:              {'Yes' if info.has_bf16 else 'No'}")
     print(f"  FP64:              {'Yes' if info.has_fp64 else 'No'}")
+    print(f"  XMX/DPAS:          {'Yes' if info.has_xmx else 'No'}")
     print()
     print("HARDWARE DEFAULTS (use get_optimal_params for shape-aware tuning):")
     print(f"  num_warps:         {info.recommended_num_warps}")

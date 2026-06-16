@@ -75,7 +75,7 @@ _CM_DESCRIPTIONS: dict[IssueType, str] = {
     IssueType.SUBOPTIMAL_WARPS: "SIMD width is per-instruction and follows operand width — widen vector<>/matrix<> operands so the compiler emits wider SIMD (there is no lane-count knob; DPAS runs at a fixed execution size)",
     IssueType.HIGH_REGISTER_PRESSURE: "Large vector<>/matrix<> live ranges spilling the GRF — shrink tiles or split the loop",
     IssueType.CACHE_EVICTION_RISK: "Working set / SLM tile too large for L1/SLM — reduce block size or stage through SLM",
-    IssueType.UNCOALESCED_ACCESS: "Scattered / gather global loads — use LSC block loads (cm_load 1D / 2D block_2d_desc) for coalesced, cache-friendly access",
+    IssueType.UNCOALESCED_ACCESS: "Scattered / gather global loads — use LSC 1D block loads (cm_load by byte offset) for coalesced, cache-friendly access",
     IssueType.DTYPE_PRECISION: "Using float32 inputs/storage where bf16/half would feed DPAS (keep float accumulators), or float64 anywhere",
     IssueType.DTYPE_FLOAT64: "float64 in computation — extremely slow on Intel GPUs, use float/half/bf16",
     IssueType.UNFUSED_ELEMENTWISE: "Elementwise epilogue (bias/activation) not fused into the kernel before the final store",
@@ -375,8 +375,8 @@ Analyze the given CM C++ kernel and identify ALL applicable optimizations.
 - Register tiles: vector<T,N> / matrix<T,R,C> sized to the GRF budget
 - SLM staging: cm_slm_init + cm_slm_alloc, move tiles with LSC SLM ops
   (cm_store_slm / cm_load_slm), sync with cm_slm_fence + cm_barrier
-- LSC block loads: cm_load 1D (by byte offset) or 2D block_2d_desc
-  (VNNI-transform the DPAS B tile); avoid gather/scatter
+- LSC block loads: cm_load 1D (by byte offset); assemble register tiles from
+  several contiguous 1D row loads; avoid gather/scatter
 - Thread space: cm_group_id, cm_local_id, cm_linear_global_id work partitioning
 - Loop unrolling: #pragma unroll on tight, compile-time-bounded loops
 - Prefetch: cm_prefetch to hide HBM latency
@@ -609,8 +609,26 @@ class AnalyzerAgent:
         from xe_forge.prompts import PromptLibrary
 
         cfg = get_config()
-        prompts = PromptLibrary(dsl=cfg.device_config.dsl, device_type=cfg.device_config.device)
+        device_type = cfg.device_config.device
+        prompts = PromptLibrary(dsl=cfg.device_config.dsl, device_type=device_type)
         lines = [prompts.target_device_line(), ""]
+
+        # Inject the ACTUAL device name + matrix/memory capabilities so the
+        # analyzer doesn't propose patterns the target GPU can't run (e.g.
+        # recommending DPAS on Xe-LPG, which has no XMX systolic array).
+        if device_type == "xpu":
+            try:
+                from xe_forge.core.xpu_query import (
+                    format_device_capabilities_for_llm,
+                    get_xpu_config,
+                )
+
+                hw = get_xpu_config()
+                lines.append(f"ACTUAL DEVICE: {hw.name}")
+                lines.append(format_device_capabilities_for_llm(hw.has_xmx))
+                lines.append("")
+            except Exception as e:
+                logger.debug("Analyzer device capability context failed: %s", e)
 
         if target_dtype:
             lines.append(f"TARGET DTYPE: {target_dtype}")

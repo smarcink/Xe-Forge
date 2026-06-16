@@ -88,6 +88,7 @@ patterns:
     rationale: "DPAS provides far higher MAC throughput than scalar/vector FMA on the EU, for both float and integer matmul."
     expected_speedup: "3-10x for GEMM-like inner loops"
     applies_to: [gemm, matmul, conv, dpas, int8, quantized]
+    requires: [xmx]  # needs the XMX/DPAS systolic array (absent on Xe-LPG / MTL / ARL)
 
   - id: cm_simd_width
     name: "Widen vectors/matrices to let the compiler emit wider SIMD"
@@ -182,8 +183,8 @@ patterns:
     expected_speedup: "1.5-3x for memory-bound tiles"
     applies_to: [gemm, stencil, reduction, conv]
 
-  - id: cm_2d_block_load
-    name: "Use LSC 1D/2D block loads for coalesced HBM access"
+  - id: cm_1d_block_load
+    name: "Use LSC 1D block loads for coalesced HBM access"
     stage: memory_access
     before: |
       // Scattered / gather reads (per-lane offsets or cm_load4) — poor coalescing.
@@ -193,17 +194,17 @@ patterns:
       vector<uint, NElts> v =
           cm_load<uint, NElts, DataSize::Default, CacheHint::Cached, CacheHint::Cached>(surf, byte_offset);
 
-      // LSC 2D block load (requires CM_HAS_LSC_UNTYPED_2D). Use a VNNI transform
-      // load for the DPAS B matrix so the GRF layout feeds the systolic array:
-      lsc::block_2d_desc<half, 1, BlockH, BlockW> desc(base_ptr, H, W, pitch, x, y);
-      auto b_tile = cm_load<half, BlockH, BlockW, 1, lsc::LoadOp::VNNI>(desc);
+      // Build a 2D register tile from several CONTIGUOUS 1D row loads (one
+      // cm_load per row, each a coalesced block by byte offset):
+      #pragma unroll
+      for (int r = 0; r < TILE_ROWS; ++r)
+        tile.row(r) = cm_load<uint, TILE_ELEMS>(surf, (row0 + r) * pitch_bytes + col0_bytes);
     description: |
-      Replace scattered/gather reads with explicit LSC block loads so
+      Replace scattered/gather reads with explicit LSC 1D block loads so
       neighboring lanes hit contiguous memory. cm_load (1D) reads a contiguous
-      block by byte offset; the 2D block_2d_desc form reads a rectangular tile
-      and can Transpose (LoadOp::Transpose) or VNNI-transform (LoadOp::VNNI) it
-      in flight to feed DPAS.
-    rationale: "Coalesced LSC block reads maximize cache-line utilization and HBM efficiency; the 2D form also lays out tiles for DPAS."
+      block by byte offset; assemble a register tile from several contiguous 1D
+      row loads (one cm_load per row) with linear byte offsets.
+    rationale: "Coalesced LSC 1D block reads maximize cache-line utilization and HBM efficiency."
     expected_speedup: "1.3-2x"
     applies_to: [gemm, conv, memory_bound]
 
@@ -225,6 +226,7 @@ patterns:
     rationale: "DPAS native input types are narrow (bf16/half/int8); wide accumulation (float/int32) preserves numerical accuracy."
     expected_speedup: "up to 2x vs float32 inputs"
     applies_to: [gemm, matmul, mixed_precision, int8, quantized]
+    requires: [xmx]  # DPAS operand/accumulator dtype rule — only relevant with an XMX engine
 
   - id: cm_fuse_epilogue
     name: "Fuse elementwise post-ops before the store"
@@ -256,9 +258,9 @@ constraints:
     severity: critical
 
   - id: cm_coalesced_contiguous_access
-    name: "Keep global memory access coalesced via LSC block loads"
+    name: "Keep global memory access coalesced via LSC 1D block loads"
     description: |
-      Prefer LSC block access (cm_load 1D / 2D block_2d_desc) over gather/scatter
+      Prefer LSC 1D block access (cm_load by byte offset) over gather/scatter
       (cm_load4 / per-lane offsets) so a SIMD memory op maps to contiguous HBM
       and full cache lines.
     severity: warning

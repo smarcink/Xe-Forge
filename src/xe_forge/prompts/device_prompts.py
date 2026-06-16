@@ -8,7 +8,7 @@ used by the analyzer, optimizer, and planner agents.
 from __future__ import annotations
 
 _DEVICE_DESCRIPTIONS: dict[str, str] = {
-    "xpu": "Intel XPU (Data Center GPU Max / Ponte Vecchio)",
+    "xpu": "Intel Xe GPU",
     "cuda": "NVIDIA CUDA GPU",
     "cpu": "CPU",
 }
@@ -90,7 +90,7 @@ class PromptLibrary:
                     "DPAS/XMX systolic array (SystolicDepth=8; bf16/half->float, "
                     "int8 S8/U8->int32). SIMD width is per-instruction — widen "
                     "vector<>/matrix<> operands instead of setting a lane count. "
-                    "Use LSC 1D/2D block loads for coalesced HBM access, stage "
+                    "Use LSC 1D block loads for coalesced HBM access, stage "
                     "reused tiles through SLM, and keep register tiles within the "
                     f"GRF budget (grf_mode={defaults.get('grf_mode', 'large')})."
                 )

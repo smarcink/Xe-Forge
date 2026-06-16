@@ -49,6 +49,9 @@ def _target_from_pci_id(pci_id: int) -> str:
         return "xehpg"
     if 0x0BD0 <= pci_id <= 0x0BDF:  # Ponte Vecchio (Xe-HPC)
         return "xehpc"
+    if 0x7D40 <= pci_id <= 0x7DFF:  # Meteor Lake / Arrow Lake (Xe-LPG iGPU), e.g. ARL=0x7D67
+        # NOTE: Xe-LPG has NO XMX/DPAS systolic array — see _detect_device_capabilities.
+        return "xelpg"
     return ""
 
 
@@ -64,6 +67,11 @@ _CM_DEVICE_NAME_TO_TARGET: dict[str, str] = {
     "a750": "xehpg",
     "a580": "xehpg",
     "a380": "xehpg",
+    "arrow lake": "xelpg",
+    "arl": "xelpg",
+    "meteor lake": "xelpg",
+    "mtl": "xelpg",
+    "xe-lpg": "xelpg",
     "ponte vecchio": "xehpc",
     "data center gpu max": "xehpc",
     "max 1550": "xehpc",
@@ -109,6 +117,41 @@ def _detect_device_target() -> str:
     except Exception as e:
         logger.debug("CM device target detection failed: %s", e)
         return ""
+
+
+@dataclass(frozen=True)
+class CMDeviceCaps:
+    """Hardware features that gate which CM codegen patterns are usable.
+
+    Read from ``torch.xpu`` device properties (the same stable hardware flags
+    used for target detection). Defaults are optimistic (``True``): when no live
+    XPU can be queried we keep prior behavior and assume DPAS is available. Only
+    a live device that explicitly reports a missing feature flips a flag off —
+    so DPAS codegen is suppressed *only* when we positively know the target
+    lacks it (e.g. Xe-LPG / Meteor Lake / Arrow Lake, which have no XMX
+    systolic array).
+    """
+
+    has_dpas: bool = True  # XMX systolic matmul (cm_dpas) — has_subgroup_matrix_multiply_accumulate
+    queried: bool = False  # True only when a live XPU was actually inspected
+
+
+def _detect_device_capabilities() -> CMDeviceCaps:
+    """Detect XMX/DPAS support from the live XPU device.
+
+    Returns optimistic defaults (everything available) when no XPU is present or
+    the properties are missing, so the compile-only/offline path is unaffected.
+    """
+    try:
+        if not hasattr(torch, "xpu") or not torch.xpu.is_available():
+            return CMDeviceCaps()
+        props = torch.xpu.get_device_properties(torch.xpu.current_device())
+        has_dpas = bool(getattr(props, "has_subgroup_matrix_multiply_accumulate", True))
+        logger.info("CM device capabilities: XMX/DPAS=%s", "yes" if has_dpas else "NO")
+        return CMDeviceCaps(has_dpas=has_dpas, queried=True)
+    except Exception as e:
+        logger.debug("CM device capability detection failed: %s", e)
+        return CMDeviceCaps()
 
 
 # --- Input/output dtype handling -------------------------------------------
@@ -233,6 +276,7 @@ class CMExecutor:
         self.kernel_type = kernel_type
         if device_target is None:
             device_target = _detect_device_target()
+        self.device_caps = _detect_device_capabilities()
         self._compiler = CMCompiler(
             include_dirs=_include_dirs(cm_root, kernel_type),
             target_device=device_target or None,

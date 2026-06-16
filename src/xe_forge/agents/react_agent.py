@@ -246,8 +246,9 @@ class CMOptimizationReActSignature(dspy.Signature):
        vector<>/matrix<> operands to get wider SIMD; there is no lane-count
        #define. DPAS runs at a fixed execution size.
     3. Register tiles: size vector<>/matrix<> to the GRF budget (avoid spill)
-    4. Memory: LSC 1D/2D block loads (cm_load; VNNI-transform the DPAS B tile),
-       stage reused tiles through SLM (cm_store_slm/cm_load_slm), cm_prefetch
+    4. Memory: LSC 1D block loads (cm_load by byte offset; assemble tiles from
+       contiguous 1D row loads), stage reused tiles through SLM
+       (cm_store_slm/cm_load_slm), cm_prefetch
     5. Data types: bf16/half inputs with float acc, or int8 S8/U8 with int32
        acc; avoid double
     6. Unroll tight, compile-time-bounded loops with #pragma unroll

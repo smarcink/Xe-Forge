@@ -50,6 +50,7 @@ _MCPU_BY_TARGET: dict[str, str] = {
     "pvc": "PVC",
     "mtl": "MTL",
     "arl": "MTL",
+    "xelpg": "MTL",  # Xe-LPG (Meteor Lake / Arrow Lake iGPU) — no XMX/DPAS
     "tgllp": "TGLLP",
     "tgl": "TGLLP",
 }
