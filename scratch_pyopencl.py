@@ -1,27 +1,26 @@
-"""scratch_pyopencl.py -- throwaway PyOpenCL playground (DELETE LATER).
+"""CM GEMM diagnostic / micro-benchmark over PyOpenCL.
 
-Purpose: prove out PyOpenCL on this machine's Intel GPU before wiring it up to
-run CM kernels. Two CM paths are demonstrated:
+Compiles a CM ``.cpp`` ONLINE via the Intel OpenCL runtime's IGC Vector-Compute
+frontend: the raw CM source goes to clCreateProgramWithSource + clBuildProgram
+with the ``-cmc`` build option (``<cm/cm.h>``, ``_GENX_MAIN_``, ``SurfaceIndex``,
+cm_load/cm_store all just work) -- NO offline ``cmc``/SPIR-V step. The seed
+``cm_gemm`` entry is then run against a numpy golden reference and timed.
 
-  1. ONLINE source build (no cmc step!): hand the raw CM `.cpp` to the Intel
-     OpenCL runtime via clCreateProgramWithSource + clBuildProgram with the
-     `-cmc` build option. The driver's IGC Vector-Compute frontend compiles CM
-     directly -- `<cm/cm.h>`, `_GENX_MAIN_`, `SurfaceIndex`, cm_load/cm_store
-     all just work. See run_cm_source().  <-- this is the interesting one.
-  2. OFFLINE SPIR-V: cmc emits SPIR-V (`cmc k.cpp -o k.spv -emit-spirv
-     -mcpu=<plat>`) and PyOpenCL loads it via the 2-arg Program(ctx, bytes)
-     form (auto clCreateProgramWithIL). See run_spirv_stub().
+A side tool for inspecting/measuring ONE GEMM kernel outside the full pipeline.
+Its main use is passing extra ``-cmc`` diagnostic flags via ``--cm-opts`` --
+e.g. ``-Qxcm_print_asm_count`` (asm instruction count) or ``-mCM_printregusage``
+(register usage) -- which the production executor does not surface. To see those
+diagnostics on every run, defeat both shader caches first:
+``$env:PYOPENCL_NO_CACHE=1; $env:NEO_CACHE_PERSISTENT=0`` (a cache HIT skips IGC).
 
-NOTE: this device does NOT advertise `cl_intel_vector_compute`, yet BOTH paths
-work -- the VC backend is present, the extension string just isn't reported.
-
-This is intentionally scratch -- remove it once the real CM executor exists.
+NOTE: this device does NOT advertise ``cl_intel_vector_compute``, yet ``-cmc``
+works -- the VC backend is present, the extension string just isn't reported.
 
 Run (use the venv python; bare `python` is system 3.14 without deps):
-    .venv\\Scripts\\python.exe scratch_pyopencl.py            # run dummy SAXPY
-    .venv\\Scripts\\python.exe scratch_pyopencl.py --list     # enumerate devices
-    .venv\\Scripts\\python.exe scratch_pyopencl.py --cm k.cpp # build CM source online
-    .venv\\Scripts\\python.exe scratch_pyopencl.py --spirv k.spv   # peek a .spv
+    python scratch_pyopencl.py --list                  # enumerate OpenCL devices
+    python scratch_pyopencl.py --cm k.cpp              # build + run + time cm_gemm
+    python scratch_pyopencl.py --cm k.cpp --m 512 --n 512 --k 512 --iters 50
+    python scratch_pyopencl.py --saxpy                 # OpenCL-C stack smoke test
 
 Device selection prefers Intel (this box also has an NVIDIA OpenCL platform).
 Override with env vars, e.g.  $env:XE_OCL_PLATFORM = "NVIDIA".
@@ -143,10 +142,11 @@ def run_dummy(n: int = 1 << 20) -> int:
 
 # ---- CM from SOURCE (no cmc!) ----------------------------------------------
 # clCreateProgramWithSource(cm_source) + clBuildProgram("-cmc") makes the Intel
-# runtime's IGC VC frontend compile CM directly. This is what cm_compiler.run()
-# could use to skip the offline cmc -> .spv step entirely.
-def run_cm_source(cpp_path: str, build_opts: str = CM_BUILD_OPTS,
-                  run: bool = True) -> int:
+# runtime's IGC VC frontend compile CM directly -- no offline cmc -> .spv step.
+# This is the path the production executor uses (see xe_forge.core.cm_worker).
+def run_cm_source(cpp_path: str, build_opts: str = CM_BUILD_OPTS, *,
+                  m: int = 256, n: int = 256, k: int = 256,
+                  iters: int = 20, warmup: int = 3) -> int:
     src = pathlib.Path(cpp_path).read_text()
     platform, device = pick_device()
     print(f"platform : {platform.name}")
@@ -169,26 +169,31 @@ def run_cm_source(cpp_path: str, build_opts: str = CM_BUILD_OPTS,
     names = [k.function_name for k in prg.all_kernels()]
     print(f"built {cpp_path} from SOURCE -> kernels: {names}")
 
-    if run and "cm_gemm" in names:
+    if "cm_gemm" in names:
         queue = cl.CommandQueue(
             ctx, properties=cl.command_queue_properties.PROFILING_ENABLE
         )
-        return run_cm_gemm(ctx, queue, prg)
+        return run_cm_gemm(ctx, queue, prg, M=m, N=n, K=k, iters=iters, warmup=warmup)
+    print(f"[warn] no 'cm_gemm' entry among {names}; built OK but nothing to run")
     return 0
 
 
 def run_cm_gemm(ctx: cl.Context, queue: cl.CommandQueue, prg: cl.Program,
-                M: int = 64, N: int = 64, K: int = 64) -> int:
-    """Drive the seed cm_gemm kernel end-to-end and verify against numpy.
+                M: int = 256, N: int = 256, K: int = 256,
+                iters: int = 20, warmup: int = 3) -> int:
+    """Drive the seed cm_gemm kernel end-to-end: verify vs numpy + time it.
 
     ABI (matches test_kernels/200_CM_Gemm.cpp): cm_gemm(SurfaceIndex A, B, D,
     int M, int N, int K). Each SurfaceIndex -> a __global buffer arg; scalars
     pass by value. A is MxK half, B is KxN half, D is MxN float (fp32 accum).
     Grid: tile (BLOCK_M=8) x (BLOCK_N=16); launch one work-item per tile
-    (local=(1,1)) so cm_group_id(d) == get_global_id(d).
+    (local=(1,1)) so cm_group_id(d) == get_global_id(d). Timing is the mean over
+    ``iters`` runs (after ``warmup``) via CL profiling events; reports TFLOPS.
     """
-    BLOCK_M, BLOCK_N = 8, 16
-    assert M % BLOCK_M == 0 and N % BLOCK_N == 0 and K % 16 == 0
+    BLOCK_M, BLOCK_N, BLOCK_K = 8, 16, 16
+    if M % BLOCK_M or N % BLOCK_N or K % BLOCK_K:
+        print(f"[fail] need M%{BLOCK_M}==N%{BLOCK_N}==K%{BLOCK_K}==0, got {M}x{N}x{K}")
+        return 1
 
     rng = np.random.default_rng(0)
     a = rng.standard_normal((M, K)).astype(np.float16)
@@ -201,58 +206,70 @@ def run_cm_gemm(ctx: cl.Context, queue: cl.CommandQueue, prg: cl.Program,
 
     gsize = (M // BLOCK_M, N // BLOCK_N)  # cm_group_id(0)->M tiles, (1)->N tiles
     lsize = (1, 1)
-    evt = prg.cm_gemm(queue, gsize, lsize, a_g, b_g, d_g,
-                      np.int32(M), np.int32(N), np.int32(K))
-    evt.wait()
+    kargs = (a_g, b_g, d_g, np.int32(M), np.int32(N), np.int32(K))
+
+    # Retrieve the kernel once; prg.cm_gemm would rebuild it every call.
+    kernel = cl.Kernel(prg, "cm_gemm")
+    for _ in range(max(0, warmup)):
+        kernel(queue, gsize, lsize, *kargs)
+    queue.finish()
+
+    iters = max(1, iters)
+    events = [kernel(queue, gsize, lsize, *kargs) for _ in range(iters)]
+    queue.finish()
+    mean_ms = sum(e.profile.end - e.profile.start for e in events) / iters * 1e-6
+    tflops = (2.0 * M * N * K) / (mean_ms * 1e-3) / 1e12
 
     d = np.empty((M, N), np.float32)
     cl.enqueue_copy(queue, d, d_g)
     queue.finish()
 
     ref = a.astype(np.float32) @ b.astype(np.float32)
-    gpu_ms = (evt.profile.end - evt.profile.start) * 1e-6
     max_err = float(np.max(np.abs(d - ref)))
     rel = max_err / (float(np.max(np.abs(ref))) + 1e-12)
     ok = rel < 2e-2  # fp16 inputs -> loose tolerance
     print(f"cm_gemm {M}x{N}x{K}  grid={gsize} local={lsize}  "
-          f"kernel={gpu_ms:.3f} ms  max_err={max_err:.4f} rel={rel:.2e}  match={ok}")
+          f"mean={mean_ms:.3f} ms/iter ({iters} iters)  {tflops:.3f} TFLOPS  "
+          f"max_err={max_err:.4f} rel={rel:.2e}  match={ok}")
     return 0 if ok else 1
 
 
-# ---- OFFLINE: load a cmc-emitted .spv (Program auto-detects SPIR-V magic) ---
-def run_spirv_stub(spv_path: str) -> int:
-    spv = pathlib.Path(spv_path).read_bytes()
-    _, device = pick_device()
-    ctx = cl.Context(devices=[device])
-    prg = cl.Program(ctx, spv).build()
-    names = [k.function_name for k in prg.all_kernels()]
-    print(f"loaded {spv_path} ({len(spv)} bytes) -> kernels: {names}")
-    return 0
-
-
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ap.add_argument("--list", action="store_true",
                     help="enumerate OpenCL devices and exit")
-    ap.add_argument("--n", type=int, default=1 << 20,
-                    help="vector length for the dummy SAXPY (default 2^20)")
     ap.add_argument("--cm", metavar="PATH",
-                    help="compile a CM .cpp ONLINE via -cmc (no cmc step); "
-                         "runs cm_gemm end-to-end if present")
+                    help="compile a CM .cpp ONLINE via -cmc and run/time its cm_gemm entry")
     ap.add_argument("--cm-opts", default=CM_BUILD_OPTS,
-                    help=f"clBuildProgram options for --cm (default {CM_BUILD_OPTS!r})")
-    ap.add_argument("--spirv", metavar="PATH",
-                    help="load a .spv (e.g. a cmc kernel) and list its kernels")
+                    help=f"clBuildProgram options for --cm (default {CM_BUILD_OPTS!r}); "
+                         "add diagnostics e.g. -Qxcm_print_asm_count -mCM_printregusage")
+    ap.add_argument("--m", type=int, default=256, help="GEMM M (default 256)")
+    ap.add_argument("--n", type=int, default=256, help="GEMM N (default 256)")
+    ap.add_argument("--k", type=int, default=256, help="GEMM K (default 256)")
+    ap.add_argument("--iters", type=int, default=20,
+                    help="timed iterations for --cm (default 20)")
+    ap.add_argument("--warmup", type=int, default=3,
+                    help="warmup iterations for --cm (default 3)")
+    ap.add_argument("--saxpy", action="store_true",
+                    help="run an OpenCL-C SAXPY stack smoke test")
+    ap.add_argument("--saxpy-n", type=int, default=1 << 20,
+                    help="vector length for --saxpy (default 2^20)")
     args = ap.parse_args(argv)
 
     if args.list:
         list_devices()
         return 0
     if args.cm:
-        return run_cm_source(args.cm, build_opts=args.cm_opts)
-    if args.spirv:
-        return run_spirv_stub(args.spirv)
-    return run_dummy(args.n)
+        return run_cm_source(args.cm, build_opts=args.cm_opts,
+                             m=args.m, n=args.n, k=args.k,
+                             iters=args.iters, warmup=args.warmup)
+    if args.saxpy:
+        return run_dummy(args.saxpy_n)
+    ap.print_help()
+    return 0
 
 
 if __name__ == "__main__":
