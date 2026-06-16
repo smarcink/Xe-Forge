@@ -379,7 +379,6 @@ Analyze the given CM C++ kernel and identify ALL applicable optimizations.
   several contiguous 1D row loads; avoid gather/scatter
 - Thread space: cm_group_id, cm_local_id, cm_linear_global_id work partitioning
 - Loop unrolling: #pragma unroll on tight, compile-time-bounded loops
-- Prefetch: cm_prefetch to hide HBM latency
 - Data types: bf16/half inputs with float acc, or int8 (S8/U8) with int32 acc;
   avoid double
 

@@ -447,7 +447,6 @@ class CMOptimizationSignature(dspy.Signature):
       row loads
     - Thread space: cm_group_id, cm_local_id, cm_linear_global_id partitioning
     - Loop unrolling: #pragma unroll on the K loop
-    - Prefetch: cm_prefetch to hide HBM latency
     - Data types: bf16/half inputs with float accumulate, or int8 (S8/U8) with
       int32 accumulate; avoid double
 
@@ -458,8 +457,7 @@ class CMOptimizationSignature(dspy.Signature):
       int32 accumulators); avoid double.
     FUSION: fuse elementwise post-ops (bias, activation, scale, clamp) into the
       producing kernel before the store — applies to ANY kernel, not just GEMM.
-    MEMORY_ACCESS: use LSC 1D block loads, stage reused tiles through SLM,
-      add cm_prefetch.
+    MEMORY_ACCESS: use LSC 1D block loads, stage reused tiles through SLM.
     DEVICE_SPECIFIC: map matmul/conv inner loops onto DPAS (SystolicDepth=8),
       widen operands so the compiler emits wider SIMD, and size the per-thread
       tile to the GRF/EU budget of the target Xe device.

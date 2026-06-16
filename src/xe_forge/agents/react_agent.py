@@ -248,7 +248,7 @@ class CMOptimizationReActSignature(dspy.Signature):
     3. Register tiles: size vector<>/matrix<> to the GRF budget (avoid spill)
     4. Memory: LSC 1D block loads (cm_load by byte offset; assemble tiles from
        contiguous 1D row loads), stage reused tiles through SLM
-       (cm_store_slm/cm_load_slm), cm_prefetch
+       (cm_store_slm/cm_load_slm)
     5. Data types: bf16/half inputs with float acc, or int8 S8/U8 with int32
        acc; avoid double
     6. Unroll tight, compile-time-bounded loops with #pragma unroll
