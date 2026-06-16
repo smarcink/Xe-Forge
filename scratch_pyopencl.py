@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import os
 import pathlib
+import re
 import sys
 
 import numpy as np
@@ -52,6 +53,27 @@ __kernel void saxpy(const float a,
 # online. `-vc-codegen` is the ESIMD/VC-SPIRV path and does NOT work for CM
 # source here; `-cmc` (the CM frontend) is the one that accepts cm/cm.h kernels.
 CM_BUILD_OPTS = "-cmc"
+
+# `#define NAME VALUE` matcher -- mirrors xe_forge.core.cm_grid.extract_defines,
+# kept local so this scratch tool stays standalone (no PYTHONPATH/import needed).
+_DEFINE_RE = re.compile(
+    r"^[ \t]*#[ \t]*define[ \t]+([A-Za-z_]\w*)[ \t]+(\S+)", re.MULTILINE
+)
+
+
+def extract_defines(src: str) -> dict[str, int]:
+    """Return integer ``#define NAME VALUE`` pairs (decimal or 0x/0o/0b).
+
+    Used to read the kernel's tiling knobs (BLOCK_M/N/K) straight from the
+    source so the launch grid tracks the kernel instead of being hardcoded.
+    """
+    defines: dict[str, int] = {}
+    for name, token in _DEFINE_RE.findall(src):
+        try:
+            defines[name] = int(token, 0)  # honors 0x/0o/0b + plain decimal
+        except ValueError:
+            pass  # skip expression-/string-valued macros
+    return defines
 
 
 def _type_label(dev: cl.Device) -> str:
@@ -173,12 +195,14 @@ def run_cm_source(cpp_path: str, build_opts: str = CM_BUILD_OPTS, *,
         queue = cl.CommandQueue(
             ctx, properties=cl.command_queue_properties.PROFILING_ENABLE
         )
-        return run_cm_gemm(ctx, queue, prg, M=m, N=n, K=k, iters=iters, warmup=warmup)
+        return run_cm_gemm(ctx, queue, prg, extract_defines(src),
+                           M=m, N=n, K=k, iters=iters, warmup=warmup)
     print(f"[warn] no 'cm_gemm' entry among {names}; built OK but nothing to run")
     return 0
 
 
 def run_cm_gemm(ctx: cl.Context, queue: cl.CommandQueue, prg: cl.Program,
+                defines: dict[str, int],
                 M: int = 256, N: int = 256, K: int = 256,
                 iters: int = 20, warmup: int = 3) -> int:
     """Drive the seed cm_gemm kernel end-to-end: verify vs numpy + time it.
@@ -186,11 +210,20 @@ def run_cm_gemm(ctx: cl.Context, queue: cl.CommandQueue, prg: cl.Program,
     ABI (matches test_kernels/200_CM_Gemm.cpp): cm_gemm(SurfaceIndex A, B, D,
     int M, int N, int K). Each SurfaceIndex -> a __global buffer arg; scalars
     pass by value. A is MxK half, B is KxN half, D is MxN float (fp32 accum).
-    Grid: tile (BLOCK_M=8) x (BLOCK_N=16); launch one work-item per tile
-    (local=(1,1)) so cm_group_id(d) == get_global_id(d). Timing is the mean over
-    ``iters`` runs (after ``warmup``) via CL profiling events; reports TFLOPS.
+    The launch grid is derived from the kernel's own ``#define BLOCK_M/N/K`` so
+    editing the kernel's tiling keeps this runner correct: one work-item per
+    tile (local=(1,1)) so cm_group_id(d) == get_global_id(d). Timing is the mean
+    over ``iters`` runs (after ``warmup``) via CL profiling events; reports TFLOPS.
     """
-    BLOCK_M, BLOCK_N, BLOCK_K = 8, 16, 16
+    try:
+        BLOCK_M = defines["BLOCK_M"]
+        BLOCK_N = defines["BLOCK_N"]
+    except KeyError as e:
+        print(f"[fail] kernel source has no #define {e.args[0]}; "
+              "cannot derive launch grid")
+        return 1
+    BLOCK_K = defines.get("BLOCK_K", 1)  # only constrains the K-loop divisibility
+    print(f"tiling   : BLOCK_M={BLOCK_M} BLOCK_N={BLOCK_N} BLOCK_K={BLOCK_K} (from source)")
     if M % BLOCK_M or N % BLOCK_N or K % BLOCK_K:
         print(f"[fail] need M%{BLOCK_M}==N%{BLOCK_N}==K%{BLOCK_K}==0, got {M}x{N}x{K}")
         return 1
