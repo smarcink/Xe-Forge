@@ -25,98 +25,12 @@ import numpy as np
 import torch
 from ai_bench.harness.runner.benchmark_compare import set_all_seeds
 
-from xe_forge.core.cm_compiler import CM_ROOT, CMCompiler, CMRunResult
+from xe_forge.core.cm_compiler import CMCompiler, CMRunResult
 from xe_forge.core.cm_grid import compute_grid
 from xe_forge.core.sycl_executor import KernelType, _save_tensor
 from xe_forge.models import ExecutionResult
 
 logger = logging.getLogger(__name__)
-
-# cmc AOT device target. Override explicitly with the CM_TARGET env var or
-# CMExecutor(device_target=...). Auto-detection prefers the PCI device id /
-# architecture from torch.xpu (stable hardware identifiers) over the driver
-# "name" string, which only reflects the installed driver build.
-_CM_TARGET_ENV = "CM_TARGET"
-
-
-def _target_from_pci_id(pci_id: int) -> str:
-    """Map an Intel GPU PCI device id to a cmc architecture family."""
-    if 0xE200 <= pci_id <= 0xE2FF:  # Battlemage (Xe2), e.g. B580=0xE20B
-        return "xe2"
-    if pci_id in (0x6420, 0x64A0, 0x64B0):  # Lunar Lake (Xe2 iGPU)
-        return "xe2"
-    if (0x4F80 <= pci_id <= 0x4F88) or (0x5690 <= pci_id <= 0x56BF):  # DG2 / Arc A-series (Xe-HPG)
-        return "xehpg"
-    if 0x0BD0 <= pci_id <= 0x0BDF:  # Ponte Vecchio (Xe-HPC)
-        return "xehpc"
-    if 0x7D40 <= pci_id <= 0x7DFF:  # Meteor Lake / Arrow Lake (Xe-LPG iGPU), e.g. ARL=0x7D67
-        # NOTE: Xe-LPG has NO XMX/DPAS systolic array — see _detect_device_capabilities.
-        return "xelpg"
-    return ""
-
-
-# Legacy fallback only: substring match on the (often unreliable) device name.
-_CM_DEVICE_NAME_TO_TARGET: dict[str, str] = {
-    "battlemage": "xe2",
-    "bmg": "xe2",
-    "b580": "xe2",
-    "b570": "xe2",
-    "lunar lake": "xe2",
-    "arc": "xehpg",
-    "a770": "xehpg",
-    "a750": "xehpg",
-    "a580": "xehpg",
-    "a380": "xehpg",
-    "arrow lake": "xelpg",
-    "arl": "xelpg",
-    "meteor lake": "xelpg",
-    "mtl": "xelpg",
-    "xe-lpg": "xelpg",
-    "ponte vecchio": "xehpc",
-    "data center gpu max": "xehpc",
-    "max 1550": "xehpc",
-    "max 1100": "xehpc",
-}
-
-
-def _detect_device_target() -> str:
-    """Auto-detect the cmc AOT device target.
-
-    Priority: CM_TARGET env override -> PCI device-id range -> name fallback.
-    Returns "" when undetermined (cmc then picks its own default). The device
-    ``architecture`` int is logged to help extend the mapping for new parts.
-    """
-    env = os.environ.get(_CM_TARGET_ENV, "").strip()
-    if env:
-        logger.info("CM target '%s' (from %s)", env, _CM_TARGET_ENV)
-        return env
-    try:
-        if not hasattr(torch, "xpu") or not torch.xpu.is_available():
-            return ""
-        props = torch.xpu.get_device_properties(torch.xpu.current_device())
-        pci_id = int(getattr(props, "device_id", 0) or 0)
-        arch = getattr(props, "architecture", None)
-        target = _target_from_pci_id(pci_id)
-        if target:
-            logger.info("CM target '%s' (PCI 0x%04X, architecture=%s)", target, pci_id, arch)
-            return target
-        name = (getattr(props, "name", "") or "").lower()
-        for key, t in _CM_DEVICE_NAME_TO_TARGET.items():
-            if key in name:
-                logger.info("CM target '%s' (name fallback: '%s')", t, name)
-                return t
-        logger.warning(
-            "Could not map XPU device to a CM target (PCI 0x%04X, architecture=%s, name=%r). "
-            "Set %s=<xe2|xehpg|xehpc|...> to override.",
-            pci_id,
-            arch,
-            getattr(props, "name", ""),
-            _CM_TARGET_ENV,
-        )
-        return ""
-    except Exception as e:
-        logger.debug("CM device target detection failed: %s", e)
-        return ""
 
 
 @dataclass(frozen=True)
@@ -214,18 +128,6 @@ def _random_tensor(shape: tuple[int, ...], dtype: torch.dtype | str) -> torch.Te
     return torch.randn(shape, dtype=dt)
 
 
-def _include_dirs(cm_root: str, kernel_type: KernelType = KernelType.GEMM) -> list[str]:
-    """Header search paths for CM kernels.
-
-    TODO(cm): extend with kernel-type-specific helper headers once the SDK
-    layout is finalized.
-    """
-    dirs: list[str] = []
-    if cm_root:
-        dirs.append(f"{cm_root}/include")
-    return dirs
-
-
 @dataclass
 class CMComparisonResult:
     """Result of comparing original vs optimized CM kernel performance.
@@ -263,27 +165,16 @@ class CMExecutor:
 
     def __init__(
         self,
-        cm_root: str = CM_ROOT,
-        device_target: str | None = None,
-        compile_timeout: int = 300,
-        run_timeout: int = 120,
+        hang_timeout: int = 30,
         iterations: int = 20,
-        verify: bool = True,
         kernel_type: KernelType | str = KernelType.GEMM,
     ):
         if isinstance(kernel_type, str):
             kernel_type = KernelType(kernel_type)
         self.kernel_type = kernel_type
-        if device_target is None:
-            device_target = _detect_device_target()
         self.device_caps = _detect_device_capabilities()
-        self._compiler = CMCompiler(
-            include_dirs=_include_dirs(cm_root, kernel_type),
-            target_device=device_target or None,
-            cm_root=cm_root,
-        )
+        self._compiler = CMCompiler(hang_timeout=hang_timeout)
         self.iterations = iterations
-        self.verify = verify
         self.grid_spec: dict | None = None
         self._build_dir: str | None = None
         self._cached_input_dir: str | None = None
@@ -294,33 +185,6 @@ class CMExecutor:
         if self._build_dir is None:
             self._build_dir = tempfile.mkdtemp(prefix="cm_build_")
         return self._build_dir
-
-    def compile(
-        self,
-        source_code: str | None = None,
-        source_path: str | None = None,
-        output_name: str = "kernel_cm",
-    ) -> tuple[bool, str, str]:
-        """Compile CM C++ source to a binary. Returns (success, binary, error)."""
-        if source_code is not None:
-            src_path = Path(self.build_dir) / f"{output_name}.cpp"
-            src_path.write_text(source_code)
-        elif source_path is not None:
-            src_path = Path(source_path)
-        else:
-            return False, "", "No source code or path provided"
-
-        src_parent = str(src_path.parent)
-        if src_parent not in self._compiler.include_dirs:
-            self._compiler.include_dirs.append(src_parent)
-
-        logger.info("Compiling CM kernel: %s", src_path)
-        binary = self._compiler.compile(src_path)
-        if binary is None:
-            err = self._compiler.last_compile_error or "Compilation failed (no details)"
-            return False, "", err
-        logger.info("Compilation succeeded: %s", binary)
-        return True, str(binary), ""
 
     @staticmethod
     def _gemm_specs_from_dims(
@@ -338,6 +202,36 @@ class CMExecutor:
         k = int(d.get("K", m))
         dt = _to_torch_dtype(dtype)
         return [(m, k), (k, n)], [dt, dt]
+
+    @staticmethod
+    def _gemm_output_from_dims(
+        dims: dict[str, int | float] | None,
+    ) -> tuple[list[tuple[int, ...]], list[torch.dtype]]:
+        """GEMM fallback: output D is ``[M, N]`` fp32 (matches the seed kernel)."""
+        d = dims or {}
+        m = int(d.get("M", d.get("N", 1024)))
+        n = int(d.get("N", m))
+        return [(m, n)], [torch.float32]
+
+    def _resolve_output_sizes(
+        self,
+        dims: dict[str, int | float] | None,
+        output_shapes: list[tuple[int, ...]] | None,
+        output_dtypes: list[torch.dtype | str] | None,
+    ) -> list[int]:
+        """Byte size of each output buffer the worker allocates and dumps."""
+        if output_shapes is not None:
+            shapes = [tuple(s) for s in output_shapes]
+            dtypes = [
+                _to_torch_dtype(d)
+                for d in (output_dtypes or [torch.float32] * len(shapes))
+            ]
+        else:
+            shapes, dtypes = self._gemm_output_from_dims(dims)
+        return [
+            int(np.prod(shape)) * torch.empty((), dtype=dt).element_size()
+            for shape, dt in zip(shapes, dtypes, strict=False)
+        ]
 
     def generate_inputs(
         self,
@@ -419,45 +313,44 @@ class CMExecutor:
         output_name: str = "kernel_cm",
         input_dir: str | None = None,
         output_dir: str | None = None,
+        output_shapes: list[tuple[int, ...]] | None = None,
+        output_dtypes: list[torch.dtype | str] | None = None,
     ) -> ExecutionResult:
-        """Compile and run a CM kernel, returning structured results.
+        """Compile (online ``-cmc`` in an isolated worker) and run a CM kernel.
 
-        ``dims`` is a generic name->int map handed to the host harness (any
-        kernel, not just GEMM); m/n/k are a GEMM convenience folded into dims.
+        ``dims`` is a generic name->int map whose values become the kernel's
+        trailing scalar args (any kernel, not just GEMM); m/n/k are a GEMM
+        convenience folded into dims. Output buffer sizes come from
+        ``output_shapes``/``output_dtypes`` (defaulting to a GEMM ``[M, N]`` fp32).
         """
-        success, binary_path, err = self.compile(
-            source_code=kernel_code,
-            source_path=kernel_path,
-            output_name=output_name,
-        )
-        if not success:
-            return ExecutionResult(
-                success=False,
-                error_message=f"Compilation failed:\n{err[-2000:]}",
-            )
+        if kernel_code is not None:
+            src_path = Path(self.build_dir) / f"{output_name}.cpp"
+            src_path.write_text(kernel_code)
+        elif kernel_path is not None:
+            src_path = Path(kernel_path)
+        else:
+            return ExecutionResult(success=False, error_message="No source code or path provided")
 
         effective_dims = dims or {"M": m, "N": n, "K": k}
-        logger.info("Running CM kernel: %s (dims=%s)", binary_path, effective_dims)
-
-        kernel_source = kernel_code if kernel_code is not None else Path(kernel_path).read_text()
+        kernel_source = kernel_code if kernel_code is not None else src_path.read_text()
         try:
             grid = compute_grid(kernel_source, self.grid_spec, effective_dims)
         except ValueError as e:
             return ExecutionResult(success=False, error_message=f"Grid computation failed: {e}")
 
-        # Skip the harness's internal verify when using file-based I/O — we
-        # compare the dumped outputs in Python via compare_outputs() instead.
-        use_verify = 0 if input_dir else (1 if self.verify else 0)
+        output_sizes = self._resolve_output_sizes(effective_dims, output_shapes, output_dtypes)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
+
+        logger.info("Running CM kernel: %s (dims=%s)", src_path, effective_dims)
         result: CMRunResult = self._compiler.run(
-            Path(binary_path),
+            src_path,
             dims=effective_dims,
-            iterations=self.iterations,
-            verify=use_verify,
+            grid=grid,
+            output_sizes=output_sizes,
             input_dir=input_dir,
             output_dir=output_dir,
-            grid=grid,
+            iterations=self.iterations,
         )
         return self._to_execution_result(result)
 
@@ -492,6 +385,7 @@ class CMExecutor:
         dims: dict[str, int | float] | None = None,
         input_shapes: list[tuple[int, ...]] | None = None,
         input_dtypes: list[torch.dtype | str] | None = None,
+        output_shapes: list[tuple[int, ...]] | None = None,
         output_dtype: torch.dtype | str = "float32",
         rtol: float = 1e-2,
         atol: float = 1e-3,
@@ -522,6 +416,7 @@ class CMExecutor:
         orig_output_dir = os.path.join(io_dir, "orig_out")
         opt_output_dir = os.path.join(io_dir, "opt_out")
 
+        out_dtypes = [output_dtype] * len(output_shapes) if output_shapes else None
         orig_result = self.execute(
             kernel_code=original_code,
             kernel_path=original_path,
@@ -529,6 +424,8 @@ class CMExecutor:
             output_name="original_cm",
             input_dir=input_dir,
             output_dir=orig_output_dir,
+            output_shapes=output_shapes,
+            output_dtypes=out_dtypes,
         )
         opt_result = self.execute(
             kernel_code=optimized_code,
@@ -537,6 +434,8 @@ class CMExecutor:
             output_name="optimized_cm",
             input_dir=input_dir,
             output_dir=opt_output_dir,
+            output_shapes=output_shapes,
+            output_dtypes=out_dtypes,
         )
 
         if not orig_result.success:

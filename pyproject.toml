@@ -20,6 +20,7 @@ dependencies = [
 intel = [
   "torch==2.11+xpu",
   "pytorch-triton-xpu",
+  "pyopencl>=2025.1",
 ]
 nvidia = [
   "torch>=2.0.0",

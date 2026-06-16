@@ -1,69 +1,41 @@
 """
-CM ("C for Metal") compiler wrapper.
+CM ("C for Metal") kernel launcher.
 
-Drives the Intel CM toolchain:
-  * :meth:`CMCompiler.compile` invokes the ``cmc`` offline compiler to lower a CM
-    ``.cpp`` kernel to SPIR-V (``-emit-spirv``), and
-  * :meth:`CMCompiler.run` (still a STUB) is meant to drive an OpenCL / Level-Zero
-    host harness that uploads inputs, launches the kernel, times it over N
-    iterations, and dumps the output tensor.
+Runs a CM ``.cpp`` kernel by spawning an isolated worker process
+(:mod:`xe_forge.core.cm_worker`) that compiles the kernel ONLINE via PyOpenCL's
+``-cmc`` build option (the Intel IGC Vector-Compute frontend — no offline
+``cmc``/SPIR-V step) and launches it on the GPU.
 
-The public interface intentionally mirrors
-``ai_bench.sycl.compiler.SYCLCompiler`` so that :class:`CMExecutor` can drive it
-exactly the way ``SyclExecutor`` drives the SYCL compiler.
+Running each kernel in a separate, short-lived process is what makes the
+optimization loop robust to a hung kernel or a GPU TDR (timeout detection &
+recovery): :meth:`CMCompiler.run` enforces a hard wall-clock timeout and kills
+the worker (and its whole process tree) on expiry, returning
+``CMRunResult(success=False, ...)`` instead of taking the application down.
 
-Environment variables:
-  * ``CMC_BIN``  — path to the ``cmc`` compiler binary (default: ``cmc``).
-  * ``CM_ROOT``  — root of the CM SDK (headers under ``$CM_ROOT/include``).
-  * ``CM_MCPU``  — default ``-mcpu`` platform when no device target is resolved.
+``CMCompiler`` + ``CMRunResult`` keep the shape ``CMExecutor`` already expects so
+the optimizer consumes CM results exactly like SYCL ones.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-import shutil
+import signal
 import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from xe_forge.core.cm_grid import GridConfig
+from xe_forge.core.cm_worker import RESULT_PREFIX
 
 logger = logging.getLogger(__name__)
 
-CM_ROOT = os.environ.get("CM_ROOT", "")
-CMC_BIN = os.environ.get("CMC_BIN", "cmc")
-
-# cmc lowers CM to vISA for a concrete GPU platform passed via ``-mcpu=<PLATFORM>``
-# (BMG / DG2 / MTL / TGLLP / PVC). The rest of the codebase identifies devices by
-# architecture family ("xe2", "xehpg", "xehpc"); map those — and common aliases —
-# onto the platform names cmc expects. Unknown values are passed through upcased.
-_MCPU_BY_TARGET: dict[str, str] = {
-    "xe2": "BMG",
-    "bmg": "BMG",
-    "battlemage": "BMG",
-    "lnl": "BMG",  # Lunar Lake is also Xe2; BMG codegen applies
-    "xehpg": "DG2",
-    "dg2": "DG2",
-    "arc": "DG2",
-    "xehpc": "PVC",
-    "pvc": "PVC",
-    "mtl": "MTL",
-    "arl": "MTL",
-    "xelpg": "MTL",  # Xe-LPG (Meteor Lake / Arrow Lake iGPU) — no XMX/DPAS
-    "tgllp": "TGLLP",
-    "tgl": "TGLLP",
-}
-
-# Used when no device target can be resolved (e.g. compiling on a host without an
-# XPU). The repo's seed kernels use LSC/DPAS, so default to an Xe target.
-_DEFAULT_MCPU = os.environ.get("CM_MCPU", "BMG")
-
-# Reason surfaced to callers for the (still-stubbed) run path.
-_STUB_REASON = (
-    "CM run path is not implemented yet (OpenCL/L0 host harness is stubbed). "
-    "Implement CMCompiler.run() to launch the compiled SPIR-V and time it."
-)
+# Default hard timeout (seconds) for a single kernel launch before the worker is
+# considered hung/TDR'd and force-killed. A healthy kernel runs in milliseconds.
+_DEFAULT_HANG_TIMEOUT = 30
 
 
 @dataclass
@@ -83,142 +55,197 @@ class CMRunResult:
 
 
 class CMCompiler:
-    """Compile and run CM kernels via the ``cmc`` toolchain — STUB.
+    """Launches CM kernels in an isolated PyOpenCL worker subprocess.
+
+    Each :meth:`run` spawns :mod:`xe_forge.core.cm_worker` to compile (online
+    ``-cmc``) and execute one kernel, bounded by a hard ``hang_timeout`` so a
+    hanging kernel / GPU TDR cannot wedge the parent process.
 
     Args:
-        include_dirs: Header search paths handed to ``cmc`` (``-I``).
-        target_device: AOT device target (e.g. ``"bmg"`, ``"pvc"``). May be
-            ``None`` to let the compiler pick a default.
-        cmc_bin: Path to the ``cmc`` binary.
-        cm_root: Root of the CM SDK (its ``include`` dir is added automatically).
+        hang_timeout: Seconds to wait for a kernel run before killing the worker
+            and reporting a graceful failure. A healthy kernel runs in ms.
+        build_options: PyOpenCL ``clBuildProgram`` options for the online CM
+            compile (``-cmc`` selects the IGC Vector-Compute frontend).
     """
 
     def __init__(
         self,
-        include_dirs: list[str] | None = None,
-        target_device: str | None = None,
-        cmc_bin: str = CMC_BIN,
-        cm_root: str = CM_ROOT,
+        hang_timeout: int = _DEFAULT_HANG_TIMEOUT,
+        build_options: str = "-cmc",
     ):
-        self.include_dirs: list[str] = list(include_dirs or [])
-        if cm_root:
-            sdk_include = str(Path(cm_root) / "include")
-            if sdk_include not in self.include_dirs:
-                self.include_dirs.append(sdk_include)
-        self.target_device = target_device
-        self.cmc_bin = cmc_bin
-        self.cm_root = cm_root
-        self.last_compile_error: str | None = None
-
-    @property
-    def available(self) -> bool:
-        """True when the ``cmc`` compiler can be found on PATH / at CMC_BIN."""
-        return shutil.which(self.cmc_bin) is not None or Path(self.cmc_bin).is_file()
-
-    @property
-    def mcpu(self) -> str:
-        """The ``-mcpu`` platform name cmc should target."""
-        target = (self.target_device or "").strip().lower()
-        if not target:
-            return _DEFAULT_MCPU
-        return _MCPU_BY_TARGET.get(target, target.upper())
-
-    def _subprocess_env(self) -> dict[str, str]:
-        """Environment for invoking cmc, ensuring its sibling DLLs/.so resolve.
-
-        cmc loads ``clangFEWrapper`` from its own directory, so that directory is
-        prepended to PATH (Windows) / LD_LIBRARY_PATH (Linux).
-        """
-        env = os.environ.copy()
-        cmc_path = shutil.which(self.cmc_bin) or self.cmc_bin
-        cmc_dir = str(Path(cmc_path).resolve().parent)
-        if os.name == "nt":
-            env["PATH"] = cmc_dir + os.pathsep + env.get("PATH", "")
-        else:
-            env["LD_LIBRARY_PATH"] = cmc_dir + os.pathsep + env.get("LD_LIBRARY_PATH", "")
-        return env
-
-    def compile(self, src_path: str | Path) -> Path | None:
-        """Compile a CM ``.cpp`` source to SPIR-V via ``cmc``.
-
-        Invokes ``cmc <src> -o <src>.spv -emit-spirv -mcpu=<PLATFORM>`` (plus any
-        configured ``-I`` include dirs). Emitting SPIR-V keeps compilation offline
-        and device-free — the runtime JITs it at load — so this does not require
-        ``ocloc``. Returns the path to the ``.spv`` on success, or ``None`` on
-        failure (with :attr:`last_compile_error` populated).
-        """
-        src_path = Path(src_path)
-        if not src_path.is_file():
-            self.last_compile_error = f"CM source not found: {src_path}"
-            return None
-
-        if not self.available:
-            self.last_compile_error = f"cmc compiler not found (CMC_BIN={self.cmc_bin!r})."
-            logger.warning(self.last_compile_error)
-            return None
-
-        out_path = src_path.with_suffix(".spv")
-        cmd = [
-            self.cmc_bin,
-            str(src_path),
-            "-o", str(out_path),
-            "-emit-spirv",
-            f"-mcpu={self.mcpu}",
-            *[f"-I{d}" for d in self.include_dirs],
-        ]
-        logger.info("Compiling CM kernel: %s", " ".join(cmd))
-
-        try:
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                env=self._subprocess_env(),
-                check=False,
-            )
-        except OSError as e:
-            self.last_compile_error = f"Failed to invoke cmc ({self.cmc_bin!r}): {e}"
-            logger.warning(self.last_compile_error)
-            return None
-
-        if proc.returncode != 0 or not out_path.is_file():
-            self.last_compile_error = (
-                proc.stderr.strip() or proc.stdout.strip() or "cmc failed (no diagnostics)"
-            )
-            logger.warning("cmc compilation failed:\n%s", self.last_compile_error)
-            return None
-
-        self.last_compile_error = None
-        logger.info("Compiled CM kernel -> %s", out_path)
-        return out_path
+        self.hang_timeout = hang_timeout
+        self.build_options = build_options
 
     def run(
         self,
-        binary: str | Path,
+        source_path: str | Path,
+        *,
         dims: dict[str, int | float] | None = None,
-        iterations: int = 20,
-        verify: int = 0,
+        grid: GridConfig,
+        output_sizes: list[int],
         input_dir: str | None = None,
         output_dir: str | None = None,
-        grid: GridConfig | None = None,
+        iterations: int = 20,
+        warmup: int = 3,
+        entry: str | None = None,
     ) -> CMRunResult:
-        """Run a compiled CM kernel and parse its timing output — STUB.
+        """Compile + launch a CM kernel in an isolated worker and time it.
 
-        ``dims`` is a generic name->int map (e.g. ``{"M": .., "N": .., "K": ..}``
-        for a GEMM, but any kernel's shape parameters) passed to the host harness
-        as CLI args. ``grid`` is the concrete launch geometry resolved by
-        :func:`xe_forge.core.cm_grid.compute_grid` from the kernel's ``#define``
-        block sizes; the harness binds it as the ND-range / work-group size.
-        ``input_dir`` (when given) holds the shared input tensors the harness
-        binds as STATEFUL buffers (``input_0.bin``, ``input_1.bin``, ...);
-        ``output_dir`` is where it dumps the result (``output_0.bin``) for
-        external correctness comparison. When ``input_dir`` is set, ``verify`` is
-        typically 0 because correctness is checked in Python against those dumps.
+        The kernel ABI is inputs (``input_0.bin``, ``input_1.bin``, ... from
+        ``input_dir``, in order) -> outputs (one ``output_<i>.bin`` per entry in
+        ``output_sizes``, written to ``output_dir``) -> scalars (``dims`` values,
+        in order). ``grid`` is the launch geometry from
+        :func:`xe_forge.core.cm_grid.compute_grid`.
 
-        TODO(cm): execute the host harness with the given dims, iteration count,
-        and ``grid.global_size`` / ``grid.local_size`` (written into the launch
-        manifest), loading inputs from ``input_dir`` and dumping
-        ``output_dir/output_0.bin``, parse "<tflops> TFlop/s (<ms>) ms", and
-        return timing.
+        A hung kernel / GPU TDR is bounded by ``self.hang_timeout``: the worker
+        (and its process tree) is force-killed and ``CMRunResult(success=False)``
+        is returned, so the optimizer degrades gracefully instead of crashing.
         """
-        return CMRunResult(success=False, error=_STUB_REASON, grid=grid)
+        source_path = Path(source_path)
+        if not source_path.is_file():
+            return CMRunResult(
+                success=False, error=f"CM source not found: {source_path}", grid=grid
+            )
+
+        work_dir = Path(output_dir) if output_dir else Path(tempfile.mkdtemp(prefix="cm_run_"))
+        work_dir.mkdir(parents=True, exist_ok=True)
+
+        manifest = {
+            "source_path": str(source_path),
+            "build_options": self.build_options,
+            "entry": entry,
+            "input_dir": str(input_dir) if input_dir else "",
+            "inputs": _ordered_inputs(input_dir),
+            "outputs": [
+                {"file": f"output_{i}.bin", "bytes": int(n)}
+                for i, n in enumerate(output_sizes)
+            ],
+            "scalars": [_scalar_spec(v) for v in (dims or {}).values()],
+            "grid": {"global": list(grid.global_size), "local": list(grid.local_size)},
+            "output_dir": str(output_dir) if output_dir else "",
+            "warmup": warmup,
+            "iterations": iterations,
+        }
+        manifest_path = work_dir / "cm_launch.json"
+        manifest_path.write_text(json.dumps(manifest))
+
+        cmd = [sys.executable, "-m", "xe_forge.core.cm_worker", str(manifest_path)]
+        popen_kwargs: dict = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "text": True,
+        }
+        # Put the worker in its own process group/session so a wedged driver
+        # thread can't orphan grandchildren — we kill the whole tree on timeout.
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+
+        logger.info("Launching CM worker: %s", " ".join(cmd))
+        try:
+            proc = subprocess.Popen(cmd, **popen_kwargs)
+        except OSError as e:
+            return CMRunResult(success=False, error=f"failed to spawn CM worker: {e}", grid=grid)
+
+        try:
+            stdout, stderr = proc.communicate(timeout=self.hang_timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            try:
+                proc.communicate(timeout=5)
+            except Exception:
+                pass
+            logger.warning(
+                "CM worker timed out after %ss — killed (hang/TDR).", self.hang_timeout
+            )
+            return CMRunResult(
+                success=False,
+                error=(
+                    f"hang/TDR: CM kernel did not finish within {self.hang_timeout}s "
+                    "and was force-killed"
+                ),
+                grid=grid,
+            )
+
+        result = _parse_result(stdout)
+        if result is None:
+            tail = (stderr or stdout or "").strip()[-2000:]
+            return CMRunResult(
+                success=False,
+                error=f"CM worker produced no result (exit {proc.returncode}):\n{tail}",
+                grid=grid,
+            )
+        if not result.get("success"):
+            stage = result.get("stage", "?")
+            return CMRunResult(
+                success=False,
+                error=f"[{stage}] {result.get('error', 'unknown error')}",
+                grid=grid,
+            )
+        return CMRunResult(
+            success=True, passed=None, time_ms=result.get("time_ms"), grid=grid
+        )
+
+
+def _ordered_inputs(input_dir: str | None) -> list[str]:
+    """Return ``input_0.bin``, ``input_1.bin``, ... that exist in ``input_dir``,
+    in contiguous numeric (ABI) order."""
+    if not input_dir:
+        return []
+    base = Path(input_dir)
+    names: list[str] = []
+    i = 0
+    while (base / f"input_{i}.bin").is_file():
+        names.append(f"input_{i}.bin")
+        i += 1
+    return names
+
+
+def _scalar_spec(value: int | float) -> dict:
+    """Describe a scalar kernel arg for the manifest (int -> int32, else float32)."""
+    if isinstance(value, bool):  # bool is an int subclass — treat as int32
+        return {"value": int(value), "type": "int32"}
+    if isinstance(value, int):
+        return {"value": value, "type": "int32"}
+    return {"value": float(value), "type": "float32"}
+
+
+def _parse_result(stdout: str | None) -> dict | None:
+    """Extract the worker's sentinel-prefixed JSON result from ``stdout``.
+
+    Scans from the end so any earlier driver chatter (e.g. ``-cmc`` asm-count
+    output) is ignored. Returns ``None`` if no valid result line is present.
+    """
+    if not stdout:
+        return None
+    for line in reversed(stdout.splitlines()):
+        if line.startswith(RESULT_PREFIX):
+            try:
+                return json.loads(line[len(RESULT_PREFIX):])
+            except json.JSONDecodeError:
+                return None
+    return None
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Force-kill the worker and all its descendants.
+
+    A GPU TDR can leave driver threads wedged; killing only the immediate child
+    may orphan grandchildren. On Windows use ``taskkill /T``; on POSIX kill the
+    process group created via ``start_new_session``.
+    """
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                check=False,
+            )
+        else:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass

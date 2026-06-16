@@ -135,7 +135,6 @@ def create_executor_from_config(
 
     if config.device_config.dsl == DSL.CM:
         return CMExecutor(
-            verify=config.optimization.require_correctness,
             kernel_type=kernel_type,
         )
     if config.device_config.dsl == DSL.SYCL:
