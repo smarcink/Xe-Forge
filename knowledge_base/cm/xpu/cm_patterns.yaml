@@ -344,3 +344,109 @@ constraints:
       When the exact architecture is unknown, 128 (default) and 256 ("large
       GRF") are valid on every XeHP-and-later part.
     severity: warning
+
+  - id: cm_vector_matrix_views
+    name: "CM vector/matrix manipulation reference: views, slices, references, reshapes"
+    description: |
+      Reference (NOT a prohibition) for how CM vector<>/matrix<> data is sliced,
+      viewed, reshaped and combined. CM has NO pointers, arrays or C++ references —
+      every in-thread data movement is expressed with these member functions on
+      vector<T,N> / matrix<T,R,C> and their reference views. Getting the template
+      parameter ORDER or the view-vs-copy semantics wrong silently corrupts results,
+      so consult this before emitting any .select / .row / .column / .format /
+      .replicate / .iselect / .merge call.
+
+      BASE OBJECTS vs REFERENCE OBJECTS (views)
+        - vector<T, N> / matrix<T, R, C> are BASE objects: they OWN GRF storage.
+          N and R*C must be compile-time constants and the whole object must fit
+          the per-thread GRF (see cm_register_file_budget).
+        - vector_ref<T, N> / matrix_ref<T, R, C> are VIEWS: they own NO storage,
+          they ALIAS a region of some base object. Every read/write through a view
+          hits the base object's elements. Use a view to read or modify a sub-region
+          IN PLACE; use a base object when you want an independent copy.
+        - select / select_all / row / column / format all RETURN a *_ref view, so
+          they are valid L-VALUES:  a.select<4,2>(0) = b;  writes into a.
+        - iselect and replicate RETURN A NEW (copy) vector — they are NOT views and
+          CANNOT appear on the left-hand side of an assignment.
+        - A vector_ref / matrix_ref constructor only accepts a vector/matrix (or
+          view) of the SAME type and size whose elements are CONTIGUOUS:
+            matrix<float,8,4> m1;
+            vector_ref<float,4> v1(m1.row(2));   // v1 aliases row 2 of m1
+
+      ELEMENT ACCESS (returns a scalar l-value)
+        v(i)      m(i, j)        // function-call style
+        v[i]      m[i][j]        // array style (i = row, j = column)
+
+      SELECT — strided sub-vector / sub-matrix (returns a VIEW)
+        vector:  v.select<SIZE, STRIDE>(offset = 0)
+            // SIZE elements, STRIDE apart, starting at offset
+            b = a.select<4,2>(1);    // -> a(1), a(3), a(5), a(7)
+            a.select<4,2>(0) = b;    // write b into a(0), a(2), a(4), a(6)
+        matrix:  m.select<V_SIZE, V_STRIDE, H_SIZE, H_STRIDE>(i = 0, j = 0)
+            // V_* selects rows, H_* selects columns; (i,j) = start row,col
+            m2 = m1.select<2,2,2,4>(1,2);     // strided 2x2 sub-matrix
+            m1.select<4,1,4,2>(0,0) = 0.0f;   // zero a strided region in place
+        RESTRICTIONS: every stride must be > 0, and the stride MUST be 1 whenever
+        the matching size is 1. Out-of-bound select is allowed as an optimization
+        (out-of-bound elements are don't-cares and must not affect correctness).
+        select_all(): a view of the WHOLE object (for a matrix it equals
+        select<R,1,C,1>(0,0)); handy to pass a base object where a
+        matrix_ref<T,R,C> parameter is expected.
+
+      ROW / COLUMN (returns a VIEW)
+        v = m.row(2);        // 2nd row as a vector_ref
+        m.column(3) = 0;     // zero the 3rd column in place
+
+      FORMAT — reinterpret element type and/or reshape (returns a VIEW)
+        obj.format<T>()             // view as a flat vector<T, ...>
+        obj.format<T, R, C>()       // view as a matrix<T, R, C>
+        The object must be CONTIGUOUS and ALIGNED and the new byte size must not
+        exceed the source. This is how 16/8-bit data rides 32-bit LSC block loads
+        (see cm_block_load_requires_32bit):
+            tile.row(r) = cm_load<uint32_t, N/2>(surf, off).format<half>();   // load
+            cm_store<uint32_t, N/2>(surf, off, row.format<uint32_t>());       // store
+
+      REPLICATE — broadcast a region into a NEW vector (copy; row-major order)
+        x.replicate<REP>()                  // whole object, REP times
+        x.replicate<REP, W>(i [,j])         // REP copies of W contiguous elements
+        x.replicate<REP, VS, W>(i [,j])     // REP blocks of W, each block VS apart
+        x.replicate<REP, VS, W, HS>(i [,j]) // ... plus intra-block element stride HS
+
+      ISELECT — gather by index into a NEW vector (copy; NOT an l-value)
+        vector<ushort, K> idx;               // index type MUST be ushort
+        out = in.iselect(idx);               // out(k) = in(idx(k)); len(out)=len(idx)
+        out = m.iselect(rowIdx, colIdx);     // out(k) = m(rowIdx(k), colIdx(k));
+                                             // rowIdx and colIdx must be equal length
+
+      MASKS, COMPARISON, MERGE, BOOLEAN REDUCTIONS
+        - Comparisons are component-wise and produce a ushort MASK (0 / 1):
+            vector<ushort,N> nz = (v != 0);    matrix<ushort,R,C> ge = (a >= b);
+        - merge = masked move performed IN PLACE on the invoking object:
+            dst.merge(src, mask);             // where mask set -> dst = src
+            dst.merge(srcX, srcY, mask);      // mask set -> srcX else srcY
+          mask may be an int (bit-packed) or a vector/matrix<ushort>. In MERGE only
+          the LSB of each mask element is significant; in SIMD control flow ANY
+          non-zero element is "true" — do not conflate the two rules.
+        - Boolean reductions collapse a mask to a scalar usable in ordinary
+          (scalar) if/while:  mask.any()  -> 1 if any element non-zero;
+          mask.all() -> 1 if all non-zero.  e.g.  if ((a == 0).any()) { ... }
+
+      WHOLE-OBJECT ARITHMETIC / ASSIGNMENT
+        +, -, *, /, %, <<, >>, &, |, ^, ~ and their op= forms are all component-wise;
+        a scalar operand is broadcast to every element. Mixed shapes are allowed iff
+        the TOTAL element count matches — elements pair up in ROW-MAJOR order:
+            m2 = m1 - v1;   // v1[0..C-1] -> m1.row(0), v1[C..2C-1] -> m1.row(1), ...
+        All operands are read BEFORE the destination is written, so assignments
+        through overlapping views are well defined (v2 = v1 + v2 with aliasing views
+        uses the pre-update values).
+
+      INITIALIZING SEQUENCES (compile-time friendly; prefer over per-element stores)
+        const ushort a0_7[8] = {0,1,2,3,4,5,6,7};
+        vector<ushort,8> v(a0_7);                 // C array initializer
+        #include <cm/cmtl.h>
+        cm_vector(v, ushort, 16, 2, 3);           // DECLARES + fills v = 2,5,8,...
+        cm_matrix(m, ushort, 4, 8, 10, 5);        // DECLARES + fills m = 10,15,20,...
+        cmtl::cm_vector_assign(v.select<10,1>(2), i, 3);  // fill an existing slice
+        (cm_vector / cm_matrix DECLARE the variable themselves — do NOT declare it
+        beforehand; cm_vector_assign needs an already-declared vector or view.)
+    severity: info
