@@ -26,7 +26,7 @@ import torch
 from ai_bench.harness.runner.benchmark_compare import set_all_seeds
 
 from xe_forge.core.cm_compiler import CMCompiler, CMRunResult
-from xe_forge.core.cm_grid import compute_grid
+from xe_forge.core.cm_grid import compute_grid, parse_build_directives
 from xe_forge.core.sycl_executor import _save_tensor
 from xe_forge.models import ExecutionResult
 
@@ -331,6 +331,11 @@ class CMExecutor:
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
+        # Honor an in-source ``// xe-forge-build:`` directive (e.g. the GRF
+        # register-file size chosen by the autotuner) so a saved kernel compiles
+        # the same way the autotuner measured it.
+        extra_build_options = parse_build_directives(kernel_source)
+
         logger.info("Running CM kernel: %s (dims=%s)", src_path, effective_dims)
         result: CMRunResult = self._compiler.run(
             src_path,
@@ -340,6 +345,7 @@ class CMExecutor:
             input_dir=input_dir,
             output_dir=output_dir,
             iterations=self.iterations,
+            extra_build_options=extra_build_options,
         )
         return self._to_execution_result(result, flop=flop)
 

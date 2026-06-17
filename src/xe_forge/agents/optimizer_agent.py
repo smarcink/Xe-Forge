@@ -318,6 +318,68 @@ class AutotuneSignature(dspy.Signature):
     )
 
 
+class CMAutotuneSignature(dspy.Signature):
+    """Propose CM block-size / GRF tuning configurations for the harness to sweep.
+
+    You are an expert in Intel Xe GPU performance and CM ("C for Metal") kernels.
+
+    CM has NO runtime autotuner: block sizes are compile-time ``#define``
+    constants and the GRF register-file size is a compiler flag
+    (``-Qxcm_register_file_size``). So instead of writing an autotune decorator,
+    you PROPOSE a shortlist of candidate configurations and the harness compiles,
+    runs, and times each one on the real device, then keeps the fastest correct
+    config. Empirical measurement decides the winner — your job is to pick a
+    small, high-value set of candidates to measure.
+
+    You will receive:
+    - The current kernel code.
+    - A tuning contract naming the EXACT integer ``#define`` knobs you may tune
+      (with their current values) and the GRF flag semantics.
+    - Hardware info (compute units, GRF budget, capabilities) and problem shapes.
+
+    Return a JSON list of 6-16 configuration objects. Each object maps knob names
+    to integer values and may include an optional integer ``"grf"`` key. The knob
+    names come from the tuning contract — the names below are only an example of
+    the JSON shape, not a required naming convention:
+      {"<knob_from_contract>": 32, "<another_knob>": 64, "grf": 256}
+
+    Rules:
+    - Use ONLY the knob names from the tuning contract. Do not invent or rename
+      knobs. Every key except ``grf`` must be one of those exact names.
+    - ``grf`` is the per-thread register-file size (e.g. 128 = default, 256 =
+      "large GRF" on current Xe-LPG/Xe-HPG parts). Larger GRF allows bigger
+      register tiles but halves thread occupancy — pair it with large tiles, not
+      small ones. Omit ``grf`` to use the compiler default.
+    - Keep tile-size knobs powers of two and consistent with the kernel's tiling
+      and element-packing constraints (e.g. packed 32-bit LSC loads need even
+      inner block widths).
+    - Span a useful range: include small tiles (low register pressure, high
+      occupancy) and large tiles (more reuse, needs large GRF), and include the
+      current values as one baseline candidate.
+    - Output ONLY the list of configuration objects — never kernel code.
+    """
+
+    current_code: dspy.Code["cpp"] = dspy.InputField(desc="Current CM kernel to tune.")
+    tuning_contract: str = dspy.InputField(
+        desc="The exact integer #define knobs you may tune (names + current values) "
+        "and GRF flag semantics. Use these knob names verbatim."
+    )
+    xpu_config: str = dspy.InputField(desc="Intel XPU hardware info and GRF budget.")
+    problem_shapes: str = dspy.InputField(desc="Problem dimensions and input shapes.")
+    problem_context: str = dspy.InputField(desc="Problem size, dtype, and FLOP count.")
+    performance_context: str = dspy.InputField(
+        desc="Current baseline time and speedup so far. Empty string if not yet measured."
+    )
+    knowledge_base_context: str = dspy.InputField(
+        desc="Autotuning patterns / constraints from the knowledge base. "
+        "Empty string if KB is disabled."
+    )
+    proposed_configs: list[dict] = dspy.OutputField(
+        desc="JSON list of config objects mapping #define knob names to int values, "
+        "each optionally with an int 'grf' key. No code."
+    )
+
+
 class SyclOptimizationSignature(dspy.Signature):
     """Optimize a SYCL/CUTLASS C++ kernel for Intel XPU.
 
@@ -985,6 +1047,31 @@ class OptimizerAgent(Optimizer):
         else:
             logger.debug("No KB context for stage %s (KB disabled or empty)", stage.value)
 
+        # CM has no runtime autotuner: the LLM proposes candidate block-size/GRF
+        # configs and the harness measures them (a parameter sweep), rather than
+        # editing the kernel source the way the Triton autotune stage does.
+        if self.dsl == DSL.CM and stage == OptimizationStage.AUTOTUNING:
+            # Adopt a swept config only if it beats the CURRENT kernel (after
+            # earlier stages), falling back to the original baseline.
+            _incumbent_ms = (perf_context or {}).get("current_ms") or _baseline_ms
+            return self._autotune_cm(
+                stage=stage,
+                code=code,
+                original_code=original_code,
+                grid_spec=grid_spec,
+                spec_dims=spec_dims,
+                input_shapes=input_shapes,
+                input_dtypes=input_dtypes,
+                output_shapes=output_shapes,
+                output_dtypes=output_dtypes,
+                flop=flop,
+                xpu_text=xpu_text,
+                problem_ctx=problem_ctx,
+                perf_ctx=perf_ctx,
+                kb_context=kb_context,
+                baseline_ms=_incumbent_ms,
+            )
+
         if self.dsl in (DSL.SYCL, DSL.CM):
             if stage == OptimizationStage.ALGORITHMIC:
                 sig = (
@@ -1411,6 +1498,119 @@ class OptimizerAgent(Optimizer):
                         )
 
         return "\n".join(lines)
+
+    def _autotune_cm(
+        self,
+        *,
+        stage,
+        code,
+        original_code,
+        grid_spec,
+        spec_dims,
+        input_shapes,
+        input_dtypes,
+        output_shapes,
+        output_dtypes,
+        flop,
+        xpu_text,
+        problem_ctx,
+        perf_ctx,
+        kb_context,
+        baseline_ms,
+    ) -> StageResult:
+        """Run the CM block-size/GRF autotune sweep (LLM proposes, harness measures).
+
+        The LLM returns a shortlist of candidate configs over the kernel's
+        grid-driving ``#define``s (plus optional GRF); the harness compiles, runs,
+        and times each against the original baseline and keeps the fastest correct
+        one. Returns the winning kernel as a ``StageResult`` (or the unchanged
+        kernel when nothing beats the incumbent).
+        """
+        from xe_forge.core.cm_autotune import sweep_cm
+
+        contract = describe_grid_contract(grid_spec, code)
+        problem_shapes = self._build_problem_shapes(input_shapes)
+
+        if not self.executor:
+            logger.warning("CM autotune: no executor — cannot measure candidates")
+            return StageResult(
+                stage=stage,
+                success=False,
+                input_code=code,
+                output_code=code,
+                error_message="autotune requires an executor to measure candidates",
+            )
+
+        predict = dspy.Predict(CMAutotuneSignature)
+        try:
+            pred = predict(
+                current_code=code,
+                tuning_contract=contract,
+                xpu_config=xpu_text,
+                problem_shapes=problem_shapes,
+                problem_context=problem_ctx,
+                performance_context=perf_ctx,
+                knowledge_base_context=kb_context,
+            )
+            raw_configs = pred.proposed_configs or []
+        except Exception as e:
+            logger.warning("CM autotune: LLM config proposal failed: %s", e)
+            return StageResult(
+                stage=stage,
+                success=False,
+                input_code=code,
+                output_code=code,
+                error_message=f"autotune proposal failed: {e}",
+            )
+
+        if not isinstance(raw_configs, list):
+            raw_configs = []
+        logger.info("CM autotune: LLM proposed %d config(s)", len(raw_configs))
+
+        sweep = sweep_cm(
+            configs=raw_configs,
+            base_code=code,
+            baseline_code=original_code,
+            executor=self.executor,
+            dims=spec_dims,
+            input_shapes=input_shapes,
+            input_dtypes=input_dtypes,
+            output_shapes=output_shapes,
+            output_dtypes=output_dtypes,
+            flop=flop,
+            incumbent_ms=baseline_ms,
+        )
+
+        if not sweep.best_code or not sweep.improved:
+            return StageResult(
+                stage=stage,
+                success=True,
+                input_code=code,
+                output_code=code,
+                changes_made=[f"Autotune kept current config ({sweep.message})"],
+                reasoning=sweep.message,
+            )
+
+        changes = [
+            f"Autotuned #defines -> {sweep.best_defines}"
+            + (f", GRF={sweep.best_grf}" if sweep.best_grf is not None else "")
+            + f" ({sweep.candidates_ok}/{sweep.candidates_tried} candidates correct)"
+        ]
+        metrics_after: dict[str, float] = {}
+        if sweep.best_time_ms is not None:
+            metrics_after["execution_time_ms"] = sweep.best_time_ms
+        if sweep.best_tflops is not None:
+            metrics_after["tflops"] = sweep.best_tflops
+        return StageResult(
+            stage=stage,
+            success=True,
+            input_code=code,
+            output_code=sweep.best_code,
+            changes_made=changes,
+            reasoning=sweep.message,
+            speedup=sweep.best_speedup,
+            metrics_after=metrics_after or None,
+        )
 
     def _build_autotune_configs(self, xpu_config, input_shapes):
         try:

@@ -64,6 +64,93 @@ def extract_defines(kernel_source: str) -> dict[str, int]:
     return defines
 
 
+# A ``#define`` line with separately captured leading whitespace / name / value,
+# used by :func:`rewrite_defines` to patch a value in place without disturbing
+# the rest of the line.
+_DEFINE_LINE_RE = re.compile(
+    r"(?P<lead>^[ \t]*)#define[ \t]+(?P<name>\w+)[ \t]+(?P<val>[^\s/]+)", re.MULTILINE
+)
+
+
+def rewrite_defines(kernel_source: str, overrides: dict[str, int]) -> str:
+    """Return *kernel_source* with the value of each named ``#define`` replaced.
+
+    Only integer object-like ``#define``s already present in the source — the
+    same kind :func:`extract_defines` reports — are rewritten. Names not present,
+    or macros whose current value is not an integer literal, are left untouched
+    so a function-like or expression macro can never be clobbered. This is the
+    mechanism the autotuner uses to try candidate block sizes.
+    """
+    if not overrides:
+        return kernel_source
+
+    def _sub(m: "re.Match[str]") -> str:
+        name = m.group("name")
+        if name not in overrides:
+            return m.group(0)
+        try:
+            int(m.group("val"), 0)  # only replace genuine integer-literal macros
+        except ValueError:
+            return m.group(0)
+        return f"{m.group('lead')}#define {name} {int(overrides[name])}"
+
+    return _DEFINE_LINE_RE.sub(_sub, kernel_source)
+
+
+# Build-directive comment the executor honors to pass extra ``clBuildProgram``
+# options that cannot be expressed in the kernel source as a ``#define`` —
+# chiefly the GRF register-file size (``-Qxcm_register_file_size``), which is a
+# compiler flag, not a language construct. The autotuner stamps the winning
+# value here so the saved ``.cpp`` is self-describing and any later compile
+# (final re-measure, a human re-run) uses the same build options.
+BUILD_DIRECTIVE_PREFIX = "// xe-forge-build:"
+
+# Strict allowlist of flags honored from a build directive. The directive feeds
+# ``clBuildProgram`` and the surrounding source may be LLM-generated, so only
+# known-safe flags are accepted — anything else is dropped. Extend deliberately.
+_ALLOWED_BUILD_FLAG_RE = re.compile(r"^-Qxcm_register_file_size=\d+$")
+
+
+def parse_build_directives(kernel_source: str) -> list[str]:
+    """Extract allow-listed extra build flags from ``// xe-forge-build:`` lines.
+
+    Tokens that do not match the allowlist are dropped with a warning so a
+    (possibly LLM-generated) source comment cannot inject arbitrary compiler
+    flags into ``clBuildProgram``.
+    """
+    tokens: list[str] = []
+    for line in kernel_source.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(BUILD_DIRECTIVE_PREFIX):
+            continue
+        for tok in stripped[len(BUILD_DIRECTIVE_PREFIX):].split():
+            if _ALLOWED_BUILD_FLAG_RE.match(tok):
+                tokens.append(tok)
+            else:
+                logger.warning("Ignoring non-allowlisted CM build directive token: %r", tok)
+    return tokens
+
+
+def stamp_build_directive(kernel_source: str, tokens: list[str]) -> str:
+    """Return *kernel_source* carrying a single ``// xe-forge-build:`` line.
+
+    Any existing build-directive lines are removed first, so stamping is
+    idempotent. With no *tokens*, the source is returned with directives
+    stripped. The directive is placed at the top (it is a comment, valid before
+    ``#include``) so it survives independently of the kernel body.
+    """
+    trailing_nl = kernel_source.endswith("\n")
+    body = [
+        ln
+        for ln in kernel_source.splitlines()
+        if not ln.strip().startswith(BUILD_DIRECTIVE_PREFIX)
+    ]
+    if tokens:
+        body.insert(0, f"{BUILD_DIRECTIVE_PREFIX} {' '.join(tokens)}")
+    out = "\n".join(body)
+    return out + "\n" if trailing_nl else out
+
+
 def compute_grid(
     kernel_source: str,
     grid_spec: dict[str, Any] | None,

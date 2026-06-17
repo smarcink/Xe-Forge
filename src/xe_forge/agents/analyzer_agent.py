@@ -82,6 +82,13 @@ _CM_DESCRIPTIONS: dict[IssueType, str] = {
     IssueType.UNFUSED_KERNELS: "Multiple CM kernel enqueues that could be fused into one",
     IssueType.SUBOPTIMAL_ALGORITHM: "Naive loop where a DPAS-based or blocked formulation is faster",
     IssueType.REDUNDANT_COMPUTATION: "Repeated work (addresses, partial sums) that can be hoisted out of the loop",
+    IssueType.MISSING_AUTOTUNE: (
+        "Tile/block sizes are fixed integer #define constants and the GRF register-file size "
+        "is fixed — flag missing_autotune so the harness can sweep candidate values for the "
+        "kernel's integer #define tuning knobs (whatever they are named) and GRF sizes "
+        "(e.g. 128 vs 256) and keep the fastest measured config. Raise this whenever the kernel "
+        "has integer #defines that drive its tiling/grid."
+    ),
     IssueType.OPEN_ENDED: (
         "A novel optimization not covered by any existing issue_type. "
         "Use ONLY when you have found a concrete, high-value, implementable "
@@ -95,8 +102,10 @@ _CM_DESCRIPTIONS: dict[IssueType, str] = {
 }
 
 # CM is lower-level than Triton, so the Triton/CUTLASS-only issue types do not
-# apply. Reuse the same skip set as SYCL.
-_CM_SKIP_ISSUES: set[IssueType] = set(_SYCL_SKIP_ISSUES)
+# apply. Reuse the SYCL skip set, but KEEP ``missing_autotune``: CM block sizes
+# are compile-time #defines (and GRF is a compiler flag), so the autotuning
+# stage drives a real parameter sweep over them — see CMAutotuneSignature.
+_CM_SKIP_ISSUES: set[IssueType] = set(_SYCL_SKIP_ISSUES) - {IssueType.MISSING_AUTOTUNE}
 
 
 def _build_issue_categories(dsl: DSL = DSL.TRITON) -> str:

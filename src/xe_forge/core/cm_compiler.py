@@ -88,6 +88,7 @@ class CMCompiler:
         iterations: int = 20,
         warmup: int = 3,
         entry: str | None = None,
+        extra_build_options: list[str] | None = None,
     ) -> CMRunResult:
         """Compile + launch a CM kernel in an isolated worker and time it.
 
@@ -110,9 +111,16 @@ class CMCompiler:
         work_dir = Path(output_dir) if output_dir else Path(tempfile.mkdtemp(prefix="cm_run_"))
         work_dir.mkdir(parents=True, exist_ok=True)
 
+        # Append per-run flags (e.g. the autotuner's GRF size from a source
+        # build-directive) to the base options so a candidate can be compiled
+        # with a different register-file size without mutating the compiler.
+        build_options = self.build_options
+        if extra_build_options:
+            build_options = " ".join([build_options, *extra_build_options]).strip()
+
         manifest = {
             "source_path": str(source_path),
-            "build_options": self.build_options,
+            "build_options": build_options,
             "entry": entry,
             "input_dir": str(input_dir) if input_dir else "",
             "inputs": _ordered_inputs(input_dir),
