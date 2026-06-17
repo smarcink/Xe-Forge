@@ -197,6 +197,79 @@ patterns:
     expected_speedup: "1.2-1.5x when the epilogue is memory-bound"
     applies_to: [gemm, conv, reduction, elementwise, activation, ffn, any]
 
+  - id: cm_math_intrinsics_activation
+    name: "Map activation/transcendental epilogues to the hardware math intrinsics"
+    stage: fusion
+    before: |
+      // Activation open-coded with scalar/elementwise math — extra ops, and a
+      // classic base bug: cm_exp is 2^x, NOT e^x (see cm_exp_log_base2).
+      acc = 1.0f / (1.0f + cm_exp(-x));   // BUG: cm_exp(-x) = 2^-x, not e^-x
+    after: |
+      // Use the dedicated CM math intrinsics on the whole tile in-register (they
+      // run on the EU extended-math / shared-function unit), then store once.
+      vector<float, N> s  = cm_sigmoid(x);   // 1/(1+e^-x)   [needs CM_HAS_SIGMOID]
+      vector<float, N> t  = cm_tanh(x);      //               [needs CM_HAS_TANH]
+      vector<float, N> r  = cm_rsqrt(x);     // 1/sqrt(x)
+      vector<float, N> iv = cm_inv(x);       // 1/x
+      // Compose the common activations from them:
+      //   SiLU/Swish: x * cm_sigmoid(x)
+      //   GELU(tanh): 0.5f*x*(1 + cm_tanh(0.7978845608f*(x + 0.044715f*x*x*x)))
+      //   exp (base e): cm_exp(x * 1.44269504f)   // cm_exp is base-2!
+    description: |
+      Lower activation / transcendental epilogues to the CM math intrinsics
+      instead of open-coding them: cm_sigmoid, cm_tanh, cm_exp, cm_log, cm_pow,
+      cm_sqrt, cm_rsqrt, cm_inv, cm_sin, cm_cos. They evaluate on the EU's
+      extended-math (shared function) unit over the whole vector<>/matrix<> tile,
+      so they pair naturally with epilogue fusion (cm_fuse_epilogue): apply them
+      in-register on the accumulator before the single store.
+      CAPABILITY GATING: cm_tanh exists only when CM_HAS_TANH is defined and
+      cm_sigmoid only when CM_HAS_SIGMOID is defined; where they are absent, build
+      the activation from cm_exp/cm_inv (e.g.
+      sigmoid = cm_inv(1.0f + cm_exp(-x * 1.44269504f))). Most intrinsics are
+      half/float only — keep activations in float, never double
+      (cm_float64_forbidden). And remember cm_exp/cm_log are base-2
+      (cm_exp_log_base2).
+    rationale: "The EU extended-math unit computes sigmoid/tanh/exp/rsqrt directly on a tile, replacing multi-op open-coded formulas (and an extra HBM round-trip when fused into the epilogue)."
+    expected_speedup: "1.2-2x for activation/transcendental-heavy epilogues"
+    applies_to: [activation, fusion, ffn, attention, elementwise, gelu, silu, sigmoid, tanh, softmax]
+
+  - id: cm_reduction_intrinsics
+    name: "Use the built-in reduction intrinsics instead of manual reduction loops"
+    stage: algorithmic
+    before: |
+      // Manual scalar reduction, element by element: serial and scalar, so it
+      // idles the EU (one lane busy at a time).
+      float s = 0.0f;
+      #pragma unroll
+      for (int i = 0; i < N; ++i) s += v(i);            // sum
+      float m = v(0);
+      for (int i = 1; i < N; ++i) m = cm_max(m, v(i));  // max
+    after: |
+      // One intrinsic reduces a whole vector<>/matrix<> to a scalar using the
+      // EU reduction hardware (matrix reduces in row-major order). The template
+      // arg is the accumulator/result type:
+      float s  = cm_sum<float>(v);          // sum of all elements
+      float p  = cm_prod<float>(v);         // product of all elements
+      float mx = cm_reduced_max<float>(v);  // max element
+      float mn = cm_reduced_min<float>(v);  // min element
+      // Partial / axis reductions: reduce a .row()/.select<>() view, then combine
+      // (e.g. per-row softmax max & denominator).
+    description: |
+      CM has hardware reduction intrinsics that collapse a whole
+      vector<>/matrix<> to a scalar: cm_sum, cm_prod, cm_reduced_max,
+      cm_reduced_min. Prefer them over hand-rolled scalar loops for reductions,
+      softmax / LogSumExp denominators, norms (L2 / RMS / LayerNorm) and pooling.
+      TWO rules that bite:
+        - Reduction ORDER is not guaranteed — do not rely on summation order;
+          floating-point results can differ slightly from a left-to-right loop.
+        - These reductions (and the dot-product / sum-of-absolute-difference
+          intrinsics cm_dp2/3/4, cm_sad2) are NOT permitted inside SIMD control
+          flow (SIMD_IF_BEGIN / SIMD_DO_WHILE_BEGIN); there they would reduce
+          only the active channels. Reduce in uniform (scalar) control flow.
+    rationale: "The reduction intrinsics use the EU's reduction tree in a single instruction, versus a serial scalar loop that leaves most SIMD lanes idle."
+    expected_speedup: "2-5x for reduction-bound tiles (softmax, norms, pooling)"
+    applies_to: [reduction, softmax, layernorm, rmsnorm, pooling, attention]
+
   - id: cm_grf_register_file_size
     name: "Size the per-thread register working set to the GRF budget"
     stage: autotuning
@@ -267,6 +340,24 @@ constraints:
   - id: cm_float64_forbidden
     name: "Avoid float64 (double) in CM kernels"
     description: "Double precision is extremely slow on Intel GPUs; use float/half/bfloat16."
+    severity: critical
+
+  - id: cm_exp_log_base2
+    name: "cm_exp and cm_log are BASE-2 (2^x and log2 x), not natural exp/ln"
+    description: |
+      CRITICAL silent-correctness trap: the CM hardware math intrinsics cm_exp
+      and cm_log work in BASE 2, matching the EU's native exp2/log2 units:
+        cm_exp(x)  ==  2^x       (NOT e^x)
+        cm_log(x)  ==  log2(x)   (NOT ln x)
+      A softmax / attention / LogSumExp / GELU that calls cm_exp(x) expecting
+      e^x is WRONG on every element. Convert with the standard scaling factors:
+        e^x    ->  cm_exp(x * 1.44269504f)    // 1.4426950408889634 = log2(e)
+        ln(x)  ->  cm_log(x) * 0.69314718f    // 0.6931471805599453 = ln 2
+        a^x    ->  cm_exp(x * cm_log(a))
+      Prefer folding the log2(e) factor into a preceding scale so the base
+      conversion is FREE (e.g. fold the 1/sqrt(d) attention scale and log2(e)
+      into one multiply before cm_exp). Only exp and log are base-2 —
+      cm_pow / cm_sqrt / cm_rsqrt / cm_inv / cm_sin / cm_cos are ordinary.
     severity: critical
 
   - id: cm_register_file_budget
