@@ -61,6 +61,8 @@ class OptimizationConfig:
     target_speedup: float = 2.0  # Minimum acceptable speedup
     target_dtype: str | None = None  # "float16", "bfloat16", etc.
 
+    benchmark_iterations: int = 20  # Timed kernel launches per measurement
+
 
 @dataclass
 class DeviceConfig:
@@ -228,6 +230,7 @@ class ConfigManager:
             correctness_atol=self._get_env("CORRECTNESS_ATOL", 1e-5, float),
             target_speedup=self._get_env("TARGET_SPEEDUP", 2.0, float),
             target_dtype=self._get_env("TARGET_DTYPE", None),
+            benchmark_iterations=self._get_env("BENCHMARK_ITERATIONS", 20, int),
         )
 
         # Device Configuration

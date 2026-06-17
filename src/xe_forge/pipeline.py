@@ -66,7 +66,9 @@ class XeForgePipeline:
             if self.config.device_config.dsl == DSL.CM:
                 from xe_forge.core import CMExecutor
 
-                executor = CMExecutor()
+                executor = CMExecutor(
+                    iterations=self.config.optimization.benchmark_iterations,
+                )
             elif self.config.device_config.dsl == DSL.SYCL:
                 from xe_forge.core import SyclExecutor
 

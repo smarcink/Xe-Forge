@@ -27,7 +27,7 @@ from ai_bench.harness.runner.benchmark_compare import set_all_seeds
 
 from xe_forge.core.cm_compiler import CMCompiler, CMRunResult
 from xe_forge.core.cm_grid import compute_grid
-from xe_forge.core.sycl_executor import KernelType, _save_tensor
+from xe_forge.core.sycl_executor import _save_tensor
 from xe_forge.models import ExecutionResult
 
 logger = logging.getLogger(__name__)
@@ -167,11 +167,7 @@ class CMExecutor:
         self,
         hang_timeout: int = 30,
         iterations: int = 20,
-        kernel_type: KernelType | str = KernelType.GEMM,
     ):
-        if isinstance(kernel_type, str):
-            kernel_type = KernelType(kernel_type)
-        self.kernel_type = kernel_type
         self.device_caps = _detect_device_capabilities()
         self._compiler = CMCompiler(hang_timeout=hang_timeout)
         self.iterations = iterations
