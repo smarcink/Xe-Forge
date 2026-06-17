@@ -215,6 +215,7 @@ class XeForgePipeline:
 
         spec, flop, dtype, init_args, spec_dims, input_dtypes = None, None, None, None, None, None
         spec_grid = None
+        output_shapes, output_dtypes = None, None
         if spec_path:
             from xe_forge.core.spec_loader import load_spec
 
@@ -227,6 +228,8 @@ class XeForgePipeline:
             input_dtypes = spec.get_input_dtypes(variant_type)
             init_args = spec.get_init_args(variant_type)
             spec_grid = spec.grid
+            output_shapes = spec.get_output_shapes(variant_type)
+            output_dtypes = spec.get_output_dtypes(variant_type)
             logger.info(
                 f"Loaded spec: variant={variant_type}, shapes={input_shapes}, "
                 f"dims={spec_dims}, flop={flop}, dtype={dtype}"
@@ -265,7 +268,17 @@ class XeForgePipeline:
         )
         if self.executor and (_is_cpp or input_shapes):
             try:
-                if _is_cpp:
+                if isinstance(_bench_ex, CMExecutor):
+                    orig_r = _bench_ex.execute(
+                        kernel_code=kernel_code,
+                        dims=spec_dims,
+                        input_shapes=input_shapes,
+                        input_dtypes=input_dtypes,
+                        output_shapes=output_shapes,
+                        output_dtypes=output_dtypes,
+                        flop=flop,
+                    )
+                elif _is_cpp:
                     _cpp_dims = spec_dims or dict(
                         zip(("M", "N", "K"), _extract_gemm_dims(input_shapes), strict=False)
                     )
@@ -432,6 +445,8 @@ class XeForgePipeline:
                         ),
                     },
                     input_dtypes=input_dtypes,
+                    output_shapes=output_shapes,
+                    output_dtypes=output_dtypes,
                 )
                 result.stages_applied.append(stage_result)
 
@@ -534,7 +549,20 @@ class XeForgePipeline:
 
             if self.executor and (_is_cpp or input_shapes) and current_code != kernel_code:
                 try:
-                    if _is_cpp:
+                    if isinstance(_bench_ex, CMExecutor):
+                        opt_r = _bench_ex.execute(
+                            kernel_code=current_code,
+                            dims=spec_dims,
+                            input_shapes=input_shapes,
+                            input_dtypes=input_dtypes,
+                            output_shapes=output_shapes,
+                            output_dtypes=output_dtypes,
+                            flop=flop,
+                        )
+                    elif _is_cpp:
+                        _cpp_dims = spec_dims or dict(
+                            zip(("M", "N", "K"), _extract_gemm_dims(input_shapes), strict=False)
+                        )
                         opt_r = _bench_ex.execute(
                             kernel_code=current_code,
                             dims=_cpp_dims,

@@ -223,6 +223,41 @@ class KernelSpec:
                 dtypes.append(get_torch_dtype("float32"))
         return dtypes
 
+    def get_output_shapes(
+        self,
+        variant_type: str = "bench-gpu",
+        variant_index: int = 0,
+    ) -> list[tuple[int, ...]]:
+        """Get output tensor shapes for a variant.
+
+        Resolves each declared output's ``shape_vars`` against the variant's
+        dims. Output order follows the ``outputs:`` declaration order in the
+        spec — i.e. the kernel ABI order (inputs, then outputs, then scalars).
+        Returns ``[]`` when the spec declares no ``outputs:`` section.
+        """
+        vl = self._variants(variant_type)
+        if not vl or variant_index >= len(vl):
+            return []
+        variant = vl[variant_index]
+        shapes = []
+        for output_spec in self.outputs.values():
+            shape = tuple(variant.dims[dim] for dim in output_spec.shape_vars)
+            shapes.append(shape)
+        return shapes
+
+    def get_output_dtypes(
+        self,
+        variant_type: str = "bench-gpu",
+        variant_index: int = 0,
+    ) -> list:
+        """Get per-output torch dtypes for a variant.
+
+        Each output uses its own declared dtype from the ``outputs:`` section,
+        not the variant input-dtype override. Order matches
+        :meth:`get_output_shapes`.
+        """
+        return [get_torch_dtype(o.dtype) for o in self.outputs.values()]
+
     def get_flop(
         self,
         variant_type: str = "bench-gpu",

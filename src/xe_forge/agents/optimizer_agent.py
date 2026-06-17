@@ -72,7 +72,17 @@ def _verify_sycl(code, original_code, executor, input_shapes, spec_dims=None):
     return SUCCESS_MESSAGE
 
 
-def _verify_cm(code, original_code, executor, input_shapes, spec_dims=None, input_dtypes=None):
+def _verify_cm(
+    code,
+    original_code,
+    executor,
+    input_shapes,
+    spec_dims=None,
+    input_dtypes=None,
+    output_shapes=None,
+    output_dtypes=None,
+    flop=None,
+):
     """Verify a CM C++ kernel: basic structure check + runtime comparison."""
     if "#include" not in code:
         return "MISSING: C++ code must contain #include directives."
@@ -81,15 +91,15 @@ def _verify_cm(code, original_code, executor, input_shapes, spec_dims=None, inpu
 
     if executor:
         try:
-            _dims = spec_dims or dict(
-                zip(("M", "N", "K"), _extract_gemm_dims(input_shapes), strict=False)
-            )
             comparison = executor.compare_kernels(
                 original_code=original_code,
                 optimized_code=code,
-                dims=_dims,
+                dims=spec_dims,
                 input_shapes=input_shapes,
                 input_dtypes=input_dtypes,
+                output_shapes=output_shapes,
+                output_dtypes=output_dtypes,
+                flop=flop,
             )
             if not comparison.optimized_correct:
                 return comparison.feedback_message or "Optimized kernel failed."
@@ -686,6 +696,8 @@ class OptimizerAgent(Optimizer):
         baseline_ms: float | None = None,
         spec_dims=None,
         input_dtypes=None,
+        output_shapes=None,
+        output_dtypes=None,
     ):
         executor = self.executor
         dsl = self.dsl
@@ -703,24 +715,35 @@ class OptimizerAgent(Optimizer):
             if dsl in (DSL.SYCL, DSL.CM):
                 if dsl == DSL.CM:
                     result = _verify_cm(
-                        code, original_code, executor, input_shapes, spec_dims, input_dtypes
+                        code,
+                        original_code,
+                        executor,
+                        input_shapes,
+                        spec_dims,
+                        input_dtypes,
+                        output_shapes,
+                        output_dtypes,
+                        flop,
                     )
                 else:
                     result = _verify_sycl(code, original_code, executor, input_shapes, spec_dims)
                 if result == SUCCESS_MESSAGE and executor:
-                    _dims = spec_dims or dict(
-                        zip(("M", "N", "K"), _extract_gemm_dims(input_shapes), strict=False)
-                    )
                     try:
                         if dsl == DSL.CM:
                             c = executor.compare_kernels(
                                 original_code=original_code,
                                 optimized_code=code,
-                                dims=_dims,
+                                dims=spec_dims,
                                 input_shapes=input_shapes,
                                 input_dtypes=input_dtypes,
+                                output_shapes=output_shapes,
+                                output_dtypes=output_dtypes,
+                                flop=flop,
                             )
                         else:
+                            _dims = spec_dims or dict(
+                                zip(("M", "N", "K"), _extract_gemm_dims(input_shapes), strict=False)
+                            )
                             c = executor.compare_kernels(
                                 original_code=original_code,
                                 optimized_code=code,
@@ -893,6 +916,8 @@ class OptimizerAgent(Optimizer):
         vtune_report="",
         perf_context: dict | None = None,
         input_dtypes=None,
+        output_shapes=None,
+        output_dtypes=None,
     ):
         logger.info(f"Applying optimization stage: {stage.value}")
         original_code = code
@@ -942,6 +967,8 @@ class OptimizerAgent(Optimizer):
             baseline_ms=_baseline_ms,
             spec_dims=spec_dims,
             input_dtypes=input_dtypes,
+            output_shapes=output_shapes,
+            output_dtypes=output_dtypes,
         )
 
         problem_ctx = self._build_problem_context(input_shapes, dtype, init_args, flop)
@@ -1087,6 +1114,8 @@ class OptimizerAgent(Optimizer):
                     baseline_ms=_baseline_ms,
                     spec_dims=spec_dims,
                     input_dtypes=input_dtypes,
+                    output_shapes=output_shapes,
+                    output_dtypes=output_dtypes,
                 )
 
                 # Record this attempt for feedback to the next run
@@ -1443,6 +1472,8 @@ class OptimizerAgent(Optimizer):
         baseline_ms: float | None = None,
         spec_dims=None,
         input_dtypes=None,
+        output_shapes=None,
+        output_dtypes=None,
     ):
         if self.dsl in (DSL.SYCL, DSL.CM):
             if "#include" not in opt:
@@ -1457,15 +1488,15 @@ class OptimizerAgent(Optimizer):
                 if cached_comparison is not None:
                     c = cached_comparison
                 elif self.dsl == DSL.CM:
-                    _dims = spec_dims or dict(
-                        zip(("M", "N", "K"), _extract_gemm_dims(shapes), strict=False)
-                    )
                     c = self.executor.compare_kernels(
                         original_code=orig,
                         optimized_code=opt,
-                        dims=_dims,
+                        dims=spec_dims,
                         input_shapes=shapes,
                         input_dtypes=input_dtypes,
+                        output_shapes=output_shapes,
+                        output_dtypes=output_dtypes,
+                        flop=flop,
                     )
                 elif self.dsl == DSL.SYCL:
                     _dims = spec_dims or dict(

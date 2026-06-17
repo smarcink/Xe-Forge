@@ -86,7 +86,17 @@ def _verify_sycl(code, original_code, executor, input_shapes, spec_dims=None):
     return SUCCESS_MESSAGE
 
 
-def _verify_cm(code, original_code, executor, input_shapes, spec_dims=None, input_dtypes=None):
+def _verify_cm(
+    code,
+    original_code,
+    executor,
+    input_shapes,
+    spec_dims=None,
+    input_dtypes=None,
+    output_shapes=None,
+    output_dtypes=None,
+    flop=None,
+):
     """Verify a CM C++ kernel: basic structure check + runtime comparison."""
     if "#include" not in code:
         return "MISSING: C++ code must contain #include directives."
@@ -95,15 +105,15 @@ def _verify_cm(code, original_code, executor, input_shapes, spec_dims=None, inpu
 
     if executor:
         try:
-            _dims = spec_dims or dict(
-                zip(("M", "N", "K"), _extract_gemm_dims(input_shapes), strict=False)
-            )
             comparison = executor.compare_kernels(
                 original_code=original_code,
                 optimized_code=code,
-                dims=_dims,
+                dims=spec_dims,
                 input_shapes=input_shapes,
                 input_dtypes=input_dtypes,
+                output_shapes=output_shapes,
+                output_dtypes=output_dtypes,
+                flop=flop,
             )
             if not comparison.optimized_correct:
                 return comparison.feedback_message or "Optimized kernel failed."
@@ -327,6 +337,8 @@ class OptimizerReActAgent(Optimizer):
         dtype=None,
         spec_dims: dict[str, int] | None = None,
         input_dtypes: list | None = None,
+        output_shapes: list[tuple[int, ...]] | None = None,
+        output_dtypes: list | None = None,
     ) -> Callable:
         """Create a verification tool for ReAct.
 
@@ -349,6 +361,9 @@ class OptimizerReActAgent(Optimizer):
                     input_shapes,
                     spec_dims,
                     input_dtypes,
+                    output_shapes,
+                    output_dtypes,
+                    flop,
                 )
 
             if dsl == DSL.SYCL:
@@ -465,6 +480,8 @@ class OptimizerReActAgent(Optimizer):
         vtune_report: str = "",
         perf_context: dict | None = None,
         input_dtypes: list | None = None,
+        output_shapes: list[tuple[int, ...]] | None = None,
+        output_dtypes: list | None = None,
     ) -> StageResult:
         """
         Apply a single optimization stage using ReAct.
@@ -524,6 +541,8 @@ class OptimizerReActAgent(Optimizer):
             dtype=dtype,
             spec_dims=spec_dims,
             input_dtypes=input_dtypes,
+            output_shapes=output_shapes,
+            output_dtypes=output_dtypes,
         )
 
         # Create ReAct agent for this optimization
@@ -589,15 +608,15 @@ class OptimizerReActAgent(Optimizer):
                 # Runtime verification
                 try:
                     if self.dsl == DSL.CM:
-                        _dims = spec_dims or dict(
-                            zip(("M", "N", "K"), _extract_gemm_dims(input_shapes), strict=False)
-                        )
                         comparison = self.executor.compare_kernels(
                             original_code=original_code,
                             optimized_code=optimized_code,
-                            dims=_dims,
+                            dims=spec_dims,
                             input_shapes=input_shapes,
                             input_dtypes=input_dtypes,
+                            output_shapes=output_shapes,
+                            output_dtypes=output_dtypes,
+                            flop=flop,
                         )
                     elif self.dsl == DSL.SYCL:
                         _dims = spec_dims or dict(

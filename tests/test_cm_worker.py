@@ -254,7 +254,8 @@ def test_seed_gemm_runs_and_self_compares():
         input_shapes=[(256, 256), (256, 256)],
         input_dtypes=["float16", "float16"],
         output_shapes=[(256, 256)],
-        output_dtype="float32",
+        output_dtypes=["float32"],
+        flop=2 * 256 * 256 * 256,
         rtol=1e-2,
         atol=1e-2,
     )
@@ -262,8 +263,23 @@ def test_seed_gemm_runs_and_self_compares():
     assert result.original_correct, result.feedback_message
     assert result.optimized_correct, result.feedback_message
     assert result.original_time_ms > 0.0
+    assert result.original_tflops and result.original_tflops > 0.0
     # Identical kernels: speedup hovers around 1.0 (timing noise); sanity-band it.
     assert 0.25 < result.speedup < 4.0, result.feedback_message
+
+
+def test_compare_kernels_without_input_shapes_fails_loud():
+    """Missing input_shapes is a hard error, not a fabricated GEMM fallback."""
+    from xe_forge.core.cm_executor import CMExecutor
+
+    executor = CMExecutor(hang_timeout=30)
+    with pytest.raises(ValueError, match="input_shapes"):
+        executor.compare_kernels(
+            original_path=str(SEED_GEMM),
+            optimized_path=str(SEED_GEMM),
+            dims={"M": 256, "N": 256, "K": 256},
+            output_shapes=[(256, 256)],
+        )
 
 
 # A data-dependent infinite loop the CM frontend won't optimize away. Running it

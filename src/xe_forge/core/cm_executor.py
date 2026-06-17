@@ -182,48 +182,25 @@ class CMExecutor:
             self._build_dir = tempfile.mkdtemp(prefix="cm_build_")
         return self._build_dir
 
-    @staticmethod
-    def _gemm_specs_from_dims(
-        dims: dict[str, int | float] | None,
-        dtype: torch.dtype | str = torch.bfloat16,
-    ) -> tuple[list[tuple[int, ...]], list[torch.dtype]]:
-        """GEMM fallback: build (input_shapes, input_dtypes) for A[M,K], B[K,N].
-
-        Used only when a caller does not pass explicit ``input_shapes`` (e.g. the
-        GEMM seed). Arbitrary kernels supply their own shapes instead.
-        """
-        d = dims or {}
-        m = int(d.get("M", d.get("N", 1024)))
-        n = int(d.get("N", m))
-        k = int(d.get("K", m))
-        dt = _to_torch_dtype(dtype)
-        return [(m, k), (k, n)], [dt, dt]
-
-    @staticmethod
-    def _gemm_output_from_dims(
-        dims: dict[str, int | float] | None,
-    ) -> tuple[list[tuple[int, ...]], list[torch.dtype]]:
-        """GEMM fallback: output D is ``[M, N]`` fp32 (matches the seed kernel)."""
-        d = dims or {}
-        m = int(d.get("M", d.get("N", 1024)))
-        n = int(d.get("N", m))
-        return [(m, n)], [torch.float32]
-
     def _resolve_output_sizes(
         self,
-        dims: dict[str, int | float] | None,
         output_shapes: list[tuple[int, ...]] | None,
         output_dtypes: list[torch.dtype | str] | None,
     ) -> list[int]:
-        """Byte size of each output buffer the worker allocates and dumps."""
-        if output_shapes is not None:
-            shapes = [tuple(s) for s in output_shapes]
-            dtypes = [
-                _to_torch_dtype(d)
-                for d in (output_dtypes or [torch.float32] * len(shapes))
-            ]
-        else:
-            shapes, dtypes = self._gemm_output_from_dims(dims)
+        """Byte size of each output buffer the worker allocates and dumps.
+
+        Output shapes/dtypes come from the spec's ``outputs:`` section.
+        """
+        if not output_shapes:
+            raise ValueError(
+                "CM output sizes require explicit output_shapes from the spec "
+                "'outputs:' section; none were provided."
+            )
+        shapes = [tuple(s) for s in output_shapes]
+        dtypes = [
+            _to_torch_dtype(d)
+            for d in (output_dtypes or [torch.float32] * len(shapes))
+        ]
         return [
             int(np.prod(shape)) * torch.empty((), dtype=dt).element_size()
             for shape, dt in zip(shapes, dtypes, strict=False)
@@ -309,15 +286,20 @@ class CMExecutor:
         output_name: str = "kernel_cm",
         input_dir: str | None = None,
         output_dir: str | None = None,
+        input_shapes: list[tuple[int, ...]] | None = None,
+        input_dtypes: list[torch.dtype | str] | None = None,
         output_shapes: list[tuple[int, ...]] | None = None,
         output_dtypes: list[torch.dtype | str] | None = None,
+        flop: float | None = None,
+        seed: int = 42,
     ) -> ExecutionResult:
         """Compile (online ``-cmc`` in an isolated worker) and run a CM kernel.
 
         ``dims`` is a generic name->int map whose values become the kernel's
-        trailing scalar args (any kernel, not just GEMM); m/n/k are a GEMM
-        convenience folded into dims. Output buffer sizes come from
-        ``output_shapes``/``output_dtypes`` (defaulting to a GEMM ``[M, N]`` fp32).
+        trailing scalar args; m/n/k are a scalar-dim convenience folded into
+        dims. When ``input_dir`` is omitted, inputs are materialized from
+        ``input_shapes``/``input_dtypes``; output buffer sizes come from
+        ``output_shapes``/``output_dtypes``. ``flop`` (when given) yields TFLOPS.
         """
         if kernel_code is not None:
             src_path = Path(self.build_dir) / f"{output_name}.cpp"
@@ -334,7 +316,18 @@ class CMExecutor:
         except ValueError as e:
             return ExecutionResult(success=False, error_message=f"Grid computation failed: {e}")
 
-        output_sizes = self._resolve_output_sizes(effective_dims, output_shapes, output_dtypes)
+        # Materialize inputs from the spec's input_shapes unless the caller
+        # supplied a prepared input_dir.
+        if input_dir is None:
+            if not input_shapes:
+                raise ValueError(
+                    "CM execute() needs either input_dir or explicit input_shapes "
+                    "from the spec 'inputs:' section to bind kernel input buffers; "
+                    "neither was provided."
+                )
+            input_dir = self.get_or_create_inputs(input_shapes, input_dtypes, seed=seed)
+
+        output_sizes = self._resolve_output_sizes(output_shapes, output_dtypes)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
 
@@ -348,24 +341,27 @@ class CMExecutor:
             output_dir=output_dir,
             iterations=self.iterations,
         )
-        return self._to_execution_result(result)
+        return self._to_execution_result(result, flop=flop)
 
     @staticmethod
-    def _to_execution_result(r: CMRunResult) -> ExecutionResult:
+    def _to_execution_result(r: CMRunResult, flop: float | None = None) -> ExecutionResult:
         if not r.success:
             return ExecutionResult(success=False, error_message=f"Execution failed: {r.error}")
+        tflops = r.tflops
+        if tflops is None and flop and r.time_ms and r.time_ms > 0:
+            tflops = flop / (r.time_ms * 1e-3) / 1e12
         if r.passed is False:
             return ExecutionResult(
                 success=False,
                 output_correct=False,
                 execution_time_ms=r.time_ms,
-                tflops=r.tflops,
+                tflops=tflops,
                 error_message="Correctness verification failed",
             )
         return ExecutionResult(
             success=True,
             execution_time_ms=r.time_ms,
-            tflops=r.tflops,
+            tflops=tflops,
             output_correct=r.passed,
         )
 
@@ -382,7 +378,8 @@ class CMExecutor:
         input_shapes: list[tuple[int, ...]] | None = None,
         input_dtypes: list[torch.dtype | str] | None = None,
         output_shapes: list[tuple[int, ...]] | None = None,
-        output_dtype: torch.dtype | str = "float32",
+        output_dtypes: list[torch.dtype | str] | None = None,
+        flop: float | None = None,
         rtol: float = 1e-2,
         atol: float = 1e-3,
         input_dir: str | None = None,
@@ -390,20 +387,23 @@ class CMExecutor:
     ) -> CMComparisonResult:
         """Compare performance and correctness of original vs optimized CM kernel.
 
-        Inputs are described generically by ``input_shapes`` / ``input_dtypes``
-        (any kernel, like the Triton path). If omitted, a GEMM is assumed and the
-        shapes are derived from ``dims`` (or m/n/k). Both kernels run on identical
-        inputs; outputs (``output_0.bin``) are compared in numpy.
+        Inputs and outputs are described by the spec's
+        ``input_shapes``/``input_dtypes`` and ``output_shapes``/``output_dtypes``.
+        Both kernels run on identical inputs; the first output
+        (``output_0.bin``) is compared in numpy. ``flop`` (when given) yields
+        the original/optimized TFLOPS.
         """
         effective_dims = dims or {"M": m, "N": n, "K": k}
-        if input_shapes is not None:
-            spec_shapes = [tuple(s) for s in input_shapes]
-            spec_dtypes = [
-                _to_torch_dtype(d)
-                for d in (input_dtypes or [torch.bfloat16] * len(spec_shapes))
-            ]
-        else:
-            spec_shapes, spec_dtypes = self._gemm_specs_from_dims(effective_dims)
+        if not input_shapes:
+            raise ValueError(
+                "CM compare_kernels() requires explicit input_shapes from the "
+                "spec 'inputs:' section; none were provided."
+            )
+        spec_shapes = [tuple(s) for s in input_shapes]
+        spec_dtypes = [
+            _to_torch_dtype(d)
+            for d in (input_dtypes or [torch.bfloat16] * len(spec_shapes))
+        ]
 
         caller_owns_inputs = input_dir is not None
         io_dir = tempfile.mkdtemp(prefix="cm_compare_")
@@ -412,7 +412,6 @@ class CMExecutor:
         orig_output_dir = os.path.join(io_dir, "orig_out")
         opt_output_dir = os.path.join(io_dir, "opt_out")
 
-        out_dtypes = [output_dtype] * len(output_shapes) if output_shapes else None
         orig_result = self.execute(
             kernel_code=original_code,
             kernel_path=original_path,
@@ -421,7 +420,8 @@ class CMExecutor:
             input_dir=input_dir,
             output_dir=orig_output_dir,
             output_shapes=output_shapes,
-            output_dtypes=out_dtypes,
+            output_dtypes=output_dtypes,
+            flop=flop,
         )
         opt_result = self.execute(
             kernel_code=optimized_code,
@@ -431,7 +431,8 @@ class CMExecutor:
             input_dir=input_dir,
             output_dir=opt_output_dir,
             output_shapes=output_shapes,
-            output_dtypes=out_dtypes,
+            output_dtypes=output_dtypes,
+            flop=flop,
         )
 
         if not orig_result.success:
@@ -464,7 +465,8 @@ class CMExecutor:
         # Correctness: compare dumped outputs (output_0.bin) when available.
         opt_correct = True
         correctness_msg = ""
-        np_dt = _resolve_np_dtype(output_dtype)
+        # The first output's dtype drives the numpy reinterpret of output_0.bin.
+        np_dt = _resolve_np_dtype(output_dtypes[0] if output_dtypes else "float32")
         orig_out = os.path.join(orig_output_dir, _OUTPUT_FILE)
         opt_out = os.path.join(opt_output_dir, _OUTPUT_FILE)
         if os.path.exists(orig_out) and os.path.exists(opt_out):
