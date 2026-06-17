@@ -111,27 +111,130 @@ patterns:
     applies_to: [gemm, conv, reduction, dpas, elementwise]
 
   - id: cm_slm_staging
-    name: "Stage reused tiles through SLM with LSC SLM ops"
+    name: "Stage reused tiles through SLM with the LSC SLM ops"
     stage: memory_access
-    before: "// Every thread re-reads the same A/B tile from HBM (redundant global traffic)."
+    before: "// Every thread in the group re-reads the same shared tile from HBM (redundant global traffic)."
     after: |
-      // Cooperatively stage the shared tile in SLM once, then read it back.
+      // PRECONDITION: a real thread group (work-group size > 1). With a group
+      // of one thread, SLM and cm_barrier do nothing — see the cooperative
+      // grid knobs in the grid contract and the cm_cooperative_slm_tiling
+      // pattern for how to FORM the group.
+      cm_slm_init(SLM_BYTES);          // total per-group SLM (bytes), declared once
+      uint slm = cm_slm_alloc(SLM_BYTES);
+
+      // --- LSC SLM store: SCALAR BYTE offset, NElts a power of two <= 64 ---
+      // (half data is packed two-per-uint32, so a W-wide half row is W/2 uints
+      //  — store/read it as uint, reinterpret with .format<half>())
+      cm_store_slm<uint, NELTS>(slm_byte_offset, chunk);   // chunk is vector<uint, NELTS>
+      cm_slm_fence(CM_GLOBAL_COHERENT_FENCE);              // order the SLM writes
+      cm_barrier();                                        // visible to the whole group
+
+      // --- LSC SLM load back into registers: SAME scalar byte offset ---
+      vector<uint, NELTS> staged = cm_load_slm<uint, NELTS>(slm_byte_offset);
+      cm_barrier();   // WAR guard: all reads done before the tile is overwritten
+    description: |
+      Use Shared Local Memory to reuse a tile across a thread group and cut HBM
+      traffic. Allocate once with cm_slm_init / cm_slm_alloc; move data with the
+      LSC SLM ops cm_store_slm<T, NElts>(byte_offset, chunk) and
+      cm_load_slm<T, NElts>(byte_offset) — both take a SCALAR BYTE offset (NOT an
+      address vector) and NElts must be a power of two <= 64 (split larger tiles
+      into 64-element chunks). Synchronize writes with cm_slm_fence(
+      CM_GLOBAL_COHERENT_FENCE) THEN cm_barrier(); add a trailing cm_barrier
+      before the SLM region is reused so no thread overwrites data others are
+      still reading. The non-LSC fallback is cm_slm_write(slm, addr_elems, v) /
+      cm_slm_read(slm, addr_elems, v), whose offsets are ELEMENT indices (build
+      them with cmtl::cm_vector_assign from <cm/cmtl.h>).
+      THIS ONLY HELPS WITH A THREAD GROUP: it is a no-op (pure overhead) unless a
+      cooperative work-group-size knob is > 1 — see cm_cooperative_slm_tiling.
+    rationale: "SLM bandwidth is far higher than HBM; group-level reuse amortizes global loads, but only once the threads actually form a group."
+    expected_speedup: "1.5-3x for memory-bound tiles that are shared across a group"
+    applies_to: [gemm, stencil, reduction, conv]
+
+  - id: cm_cooperative_slm_tiling
+    name: "Form a thread group and share an input tile through SLM"
+    stage: memory_access
+    before: |
+      // Naive: one thread per output tile, local size 1. Neighbouring tiles
+      // that need the SAME input rows/columns each re-load them from HBM.
+      const int tm = cm_global_id(0) * BLOCK_M;
+      const int tn = cm_global_id(1) * BLOCK_N;
+      for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
+        // ... every thread loads its own A tile AND the shared B tile from HBM
+      }
+    after: |
+      // Raise the grid contract's work-group-size knob (named GROUP_M in THIS
+      // example — use whatever YOUR contract lists; do not invent a new name)
+      // above 1 so that neighbouring output tiles form ONE thread group. That
+      // knob already drives local size; keep per-thread tile indexing on
+      // cm_global_id so each thread still owns one distinct output tile (no
+      // redundancy). The whole group shares the SAME B sub-tile each K-step, so
+      // stage it in SLM once instead of once per thread. (The group size must
+      // divide the staged dimension — GROUP_M | BLOCK_K here.)
+      const uint lid = cm_local_id(0);              // 0..GROUP_M-1 within the group
+      const int  tm  = cm_global_id(0) * BLOCK_M;   // private row base per thread
+      const int  tn  = cm_group_id(1) * BLOCK_N;    // column base shared by the group
       cm_slm_init(SLM_BYTES);
       uint slm = cm_slm_alloc(SLM_BYTES);
-      // LSC SLM store of the cooperatively-loaded tile:
-      cm_store_slm<uint, N>(slm_offsets, tile);
-      cm_slm_fence(CM_GLOBAL_COHERENT_FENCE);   // order SLM writes
-      cm_barrier();                             // make them visible to the group
-      // LSC SLM load back into registers:
-      vector<uint, N> staged = cm_load_slm<uint, VectorSize::N1>(slm_offsets);
+      matrix<float, BLOCK_M, BLOCK_N> acc = 0.0f;
+      for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
+        // Cooperative load: each thread stages BLOCK_K/GROUP_M rows of the shared
+        // B tile into SLM (B half packed two-per-uint32 -> BLOCK_N/2 uints/row).
+        #pragma unroll
+        for (int r = 0; r < BLOCK_K / GROUP_M; r++) {
+          int krow = lid * (BLOCK_K / GROUP_M) + r;
+          vector<uint, BLOCK_N/2> brow =
+              cm_load<uint32_t, BLOCK_N/2>(surfB, ((k0 + krow) * N + tn) * sizeof(half));
+          cm_store_slm<uint, BLOCK_N/2>((krow * (BLOCK_N/2)) * sizeof(uint), brow);
+        }
+        cm_slm_fence(CM_GLOBAL_COHERENT_FENCE);
+        cm_barrier();
+        // Private A rows from HBM; shared B tile from SLM:
+        matrix<half, BLOCK_M, BLOCK_K> a;
+        #pragma unroll
+        for (int i = 0; i < BLOCK_M; i++)
+          a.row(i) = cm_load<uint32_t, BLOCK_K/2>(surfA, ((tm + i) * K + k0) * sizeof(half)).format<half>();
+        matrix<half, BLOCK_K, BLOCK_N> b;
+        #pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk++)
+          b.row(kk) = cm_load_slm<uint, BLOCK_N/2>((kk * (BLOCK_N/2)) * sizeof(uint)).format<half>();
+        #pragma unroll
+        for (int i = 0; i < BLOCK_M; i++)
+          #pragma unroll
+          for (int kk = 0; kk < BLOCK_K; kk++)
+            acc.row(i) += a(i, kk) * b.row(kk);
+        cm_barrier();   // WAR guard before the next K-step overwrites the SLM tile
+      }
     description: |
-      Use Shared Local Memory to reuse tiles across a thread group and cut HBM
-      traffic. Allocate with cm_slm_init / cm_slm_alloc, move data with the LSC
-      SLM ops (cm_store_slm / cm_load_slm), and synchronize with cm_slm_fence
-      + cm_barrier.
-    rationale: "SLM bandwidth is much higher than HBM; group-level reuse amortizes global loads."
-    expected_speedup: "1.5-3x for memory-bound tiles"
-    applies_to: [gemm, stencil, reduction, conv]
+      NAMES BELOW ARE ILLUSTRATIVE — substitute this kernel's actual identifiers.
+      The work-group-size knob (shown as GROUP_M / GROUP_N) is whatever the grid
+      contract lists; it is already wired into the launch's local size, so raise
+      THAT knob rather than inventing a new #define. BLOCK_M / BLOCK_N / BLOCK_K
+      stand for the kernel's own tile #defines.
+
+      The high-value memory optimization for GEMM-like kernels: turn the lone
+      one-thread-per-tile launch into cooperative thread groups so a tile shared
+      across the group is fetched from HBM once and reused from SLM. This needs
+      BOTH a launch change and a code change:
+        1. Raise a cooperative work-group-size #define named by the grid contract
+           (illustrated as GROUP_M; it could be WG_M, TG_M, … — use the contract's
+           name) above 1. The harness sets local size from it (#groups =
+           global / local); the global work size is unchanged, so there are no
+           redundant threads — the threads are just regrouped. Keep per-thread
+           output indexing on cm_global_id(...) (= cm_group_id*GROUP + cm_local_id)
+           so each thread still owns one distinct tile.
+        2. Within the group, split the cooperative load of the shared tile across
+           threads by cm_local_id(...), stage it in SLM (cm_store_slm), fence +
+           cm_barrier, then have every thread read it back (cm_load_slm). Grouping
+           along M shares the B tile; grouping along N shares the A tile; a 2D
+           group (the two work-group-size knobs) can share both.
+      Constraints: the work-group-size knob must divide the staged dimension
+      (e.g. the M-group size must divide the kernel's K tile) and the product of
+      the work-group-size knobs must stay <= the device max work-group size. See
+      cm_slm_staging for the SLM-op signatures and cm_slm_cooperative_correctness
+      for the synchronization rules.
+    rationale: "Sharing an input tile across a group through SLM cuts that operand's HBM traffic by the group size — the dominant lever for memory-bound GEMM without DPAS."
+    expected_speedup: "1.5-4x for memory-bound GEMM/conv tiles (scales with the group size, up to SLM/occupancy limits)"
+    applies_to: [gemm, matmul, conv, stencil]
 
   - id: cm_1d_block_load
     name: "Use LSC 1D block loads for coalesced HBM access"
@@ -358,6 +461,30 @@ constraints:
       conversion is FREE (e.g. fold the 1/sqrt(d) attention scale and log2(e)
       into one multiply before cm_exp). Only exp and log are base-2 —
       cm_pow / cm_sqrt / cm_rsqrt / cm_inv / cm_sin / cm_cos are ordinary.
+    severity: critical
+
+  - id: cm_slm_cooperative_correctness
+    name: "Shared Local Memory needs a real thread group and correct synchronization"
+    description: |
+      Rules whenever a kernel uses SLM / cm_barrier (apply in any stage):
+        - SLM and cm_barrier do NOTHING useful for a one-thread group. They pay
+          off only when a cooperative work-group-size knob (the launch local
+          size) is > 1; otherwise they are pure overhead. Form the group via the
+          grid-contract knobs — see the cm_cooperative_slm_tiling pattern.
+        - Order writes before a barrier: cm_slm_fence(CM_GLOBAL_COHERENT_FENCE)
+          THEN cm_barrier(). A barrier without the preceding fence can read stale
+          SLM. Reusing an SLM region also needs a trailing cm_barrier so no thread
+          overwrites data others are still reading (write-after-read hazard).
+        - NEVER place cm_barrier in divergent control flow (a branch/loop not
+          entered uniformly by every thread in the group): threads that skip the
+          barrier deadlock the group — on this device that can trip a display
+          TDR/reset.
+        - Per-group SLM is capped by cm_slm_init: <= 64 KB per group AND <= the
+          device local memory size; the product of the work-group-size knobs must
+          stay <= the device max work-group size (1024 on Xe-LPG / ARL).
+        - LSC SLM ops cm_store_slm / cm_load_slm take a SCALAR BYTE offset and a
+          power-of-two element count <= 64 (NOT an address vector) — see
+          cm_slm_staging.
     severity: critical
 
   - id: cm_register_file_budget

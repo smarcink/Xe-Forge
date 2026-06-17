@@ -133,6 +133,82 @@ def test_grid_contract_names_actual_knobs():
     print("[OK] Grid contract knob-naming test passed")
 
 
+def test_cooperative_grid_multiply():
+    """A local (work-group) block groups threads without changing tile count.
+
+    Each thread owns one output tile via cm_global_id; GROUP_M only controls how
+    those threads are partitioned into groups (so adjacent tiles that share an
+    input sub-tile can cooperate through SLM). #groups = global / local. At
+    GROUP=1 the grid is byte-identical to the non-cooperative default; raising
+    GROUP_M keeps the SAME global work size (no redundant threads) and just forms
+    larger groups.
+    """
+    kernel_source = (
+        "#define BLOCK_M 8\n#define BLOCK_N 16\n#define GROUP_M 1\n#define GROUP_N 1\n"
+    )
+    grid_spec = {
+        "x": "ceil(M / (BLOCK_M * GROUP_M)) * GROUP_M",
+        "y": "ceil(N / (BLOCK_N * GROUP_N)) * GROUP_N",
+        "z": 1,
+        "local": {"x": "GROUP_M", "y": "GROUP_N", "z": 1},
+    }
+    dims = {"M": 256, "N": 256, "K": 256}
+
+    # GROUP_*=1 -> identity with the non-cooperative grid.
+    grid = compute_grid(kernel_source, grid_spec, dims)
+    assert grid.global_size == (32, 16, 1), grid.global_size
+    assert grid.local_size == (1, 1, 1), grid.local_size
+
+    # Raise GROUP_M to 4 -> groups of 4 threads, SAME 32 row-tiles, no redundancy.
+    coop_source = kernel_source.replace("#define GROUP_M 1", "#define GROUP_M 4")
+    coop = compute_grid(coop_source, grid_spec, dims)
+    assert coop.global_size == (32, 16, 1), coop.global_size  # unchanged total work
+    assert coop.local_size == (4, 1, 1), coop.local_size
+    # #groups along x = global / local = 8 cooperating groups.
+    assert coop.global_size[0] // coop.local_size[0] == 8
+    print("[OK] Cooperative grid work-group test passed")
+
+
+def test_grid_divisibility_guard():
+    """global must divide evenly by local; a bad pairing raises ValueError."""
+    kernel_source = "#define BLOCK_M 8\n#define GROUP_M 3\n"
+    # global.x = ceil(256/8) = 32, local.x = 3 -> 32 % 3 != 0 -> reject.
+    grid_spec = {"x": "ceil(M / BLOCK_M)", "y": 1, "z": 1, "local": {"x": "GROUP_M"}}
+    try:
+        compute_grid(kernel_source, grid_spec, {"M": 256, "N": 256})
+        raise AssertionError("Should have rejected indivisible global/local")
+    except ValueError as e:
+        assert "multiple of local" in str(e), e
+        print("[OK] Grid divisibility guard test passed")
+
+
+def test_grid_contract_cooperative_annotation():
+    """Work-group-size knobs are flagged as cooperative levers in the contract."""
+    kernel_source = (
+        "#define BLOCK_M 8\n#define BLOCK_N 16\n#define GROUP_M 1\n#define GROUP_N 1\n"
+    )
+    grid_spec = {
+        "x": "ceil(M / BLOCK_M) * GROUP_M",
+        "y": "ceil(N / BLOCK_N) * GROUP_N",
+        "z": 1,
+        "local": {"x": "GROUP_M", "y": "GROUP_N", "z": 1},
+    }
+    contract = describe_grid_contract(grid_spec, kernel_source)
+    # Both tile and group knobs are listed.
+    assert "BLOCK_M = 8" in contract, contract
+    assert "GROUP_M = 1" in contract, contract
+    # The group knobs are annotated and the cooperative SLM guidance is present.
+    assert "work-group size" in contract, contract
+    assert "COOPERATIVE THREAD GROUPS" in contract, contract
+    assert "cm_local_id" in contract and "cm_store_slm" in contract, contract
+    # A non-cooperative kernel (no local block) gets no cooperative note.
+    plain = describe_grid_contract(
+        {"x": "ceil(M / BLOCK_M)", "y": "ceil(N / BLOCK_N)", "z": 1},
+        "#define BLOCK_M 8\n#define BLOCK_N 16\n",
+    )
+    assert "COOPERATIVE THREAD GROUPS" not in plain, plain
+    print("[OK] Grid contract cooperative annotation test passed")
+
 
 def test_grid_config_from_seed_kernel():
     """Test grid evaluation against the actual seed kernel."""
@@ -203,8 +279,10 @@ def test_load_spec_with_grid_and_outputs():
     # Check grid
     assert spec.grid is not None, "spec.grid should not be None"
     assert "x" in spec.grid, "grid should have x"
-    assert spec.grid["x"] == "ceil(M / BLOCK_M)", f"Got {spec.grid['x']}"
-    assert spec.grid["y"] == "ceil(N / BLOCK_N)", f"Got {spec.grid['y']}"
+    assert spec.grid["x"] == "ceil(M / (BLOCK_M * GROUP_M)) * GROUP_M", f"Got {spec.grid['x']}"
+    assert spec.grid["y"] == "ceil(N / (BLOCK_N * GROUP_N)) * GROUP_N", f"Got {spec.grid['y']}"
+    # The cooperative work-group (local) block is parsed too.
+    assert spec.grid.get("local", {}).get("x") == "GROUP_M", f"Got {spec.grid.get('local')}"
 
     print("[OK] Spec load with grid/outputs test passed")
 
@@ -217,6 +295,9 @@ if __name__ == "__main__":
     test_unsafe_expression_rejected()
     test_missing_symbol_diagnostic()
     test_grid_contract_names_actual_knobs()
+    test_cooperative_grid_multiply()
+    test_grid_divisibility_guard()
+    test_grid_contract_cooperative_annotation()
     test_grid_config_from_seed_kernel()
     test_load_spec_with_grid_and_outputs()
     print("\nAll grid tests passed!")

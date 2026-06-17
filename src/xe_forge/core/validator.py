@@ -450,6 +450,33 @@ class KernelValidator:
                 )
             )
 
+        # Cooperative-SLM sanity checks (only meaningful once the kernel uses SLM
+        # or a barrier). They catch the two ways cooperative staging silently goes
+        # wrong: a "group" of one thread (no cm_local_id), and a barrier that is
+        # not preceded by an SLM fence.
+        uses_slm = "cm_slm_" in code or "cm_store_slm" in code or "cm_load_slm" in code
+        if (uses_slm or "cm_barrier" in code) and "cm_local_id" not in code:
+            issues.append(
+                ValidationIssue(
+                    "slm_without_thread_group",
+                    "warning",
+                    "SLM/cm_barrier used but no cm_local_id — with a one-thread "
+                    "group these are no-ops (pure overhead).",
+                    suggestion="Raise a cooperative work-group-size knob and "
+                    "partition the shared load across the group by cm_local_id(...).",
+                )
+            )
+        if "cm_barrier" in code and "cm_slm_fence" not in code:
+            issues.append(
+                ValidationIssue(
+                    "barrier_without_slm_fence",
+                    "warning",
+                    "cm_barrier without a preceding cm_slm_fence can observe stale SLM.",
+                    suggestion="Call cm_slm_fence(CM_GLOBAL_COHERENT_FENCE) before "
+                    "cm_barrier() to order the SLM writes.",
+                )
+            )
+
         return issues
 
     # ------------------------------------------------------------------

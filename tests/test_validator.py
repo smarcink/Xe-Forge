@@ -118,3 +118,40 @@ class TestCMValidation:
         issues = KernelValidator().validate(CM_MISSING_INCLUDE, dsl="cm")
         assert any(i.check_name == "missing_include" for i in issues)
 
+    def test_cooperative_slm_kernel_has_no_slm_warnings(self):
+        code = (
+            "#include <cm/cm.h>\n"
+            'extern "C" _GENX_MAIN_ void k(SurfaceIndex d) {\n'
+            "  uint lid = cm_local_id(0);\n"
+            "  cm_slm_init(64); uint slm = cm_slm_alloc(64);\n"
+            "  vector<uint,1> v; v[0] = lid;\n"
+            "  cm_store_slm<uint,1>(lid*4, v);\n"
+            "  cm_slm_fence(CM_GLOBAL_COHERENT_FENCE); cm_barrier();\n"
+            "}\n"
+        )
+        names = {i.check_name for i in KernelValidator().validate(code, dsl="cm")}
+        assert "slm_without_thread_group" not in names
+        assert "barrier_without_slm_fence" not in names
+
+    def test_slm_without_cm_local_id_is_flagged(self):
+        code = (
+            "#include <cm/cm.h>\n"
+            'extern "C" _GENX_MAIN_ void k(SurfaceIndex d) {\n'
+            "  cm_slm_init(64); uint slm = cm_slm_alloc(64);\n"
+            "  cm_slm_fence(CM_GLOBAL_COHERENT_FENCE); cm_barrier();\n"
+            "}\n"
+        )
+        names = {i.check_name for i in KernelValidator().validate(code, dsl="cm")}
+        assert "slm_without_thread_group" in names
+
+    def test_barrier_without_fence_is_flagged(self):
+        code = (
+            "#include <cm/cm.h>\n"
+            'extern "C" _GENX_MAIN_ void k(SurfaceIndex d) {\n'
+            "  uint lid = cm_local_id(0);\n"
+            "  cm_barrier();\n"
+            "}\n"
+        )
+        names = {i.check_name for i in KernelValidator().validate(code, dsl="cm")}
+        assert "barrier_without_slm_fence" in names
+

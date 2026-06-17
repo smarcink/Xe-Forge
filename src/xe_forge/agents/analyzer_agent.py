@@ -74,7 +74,7 @@ _CM_DESCRIPTIONS: dict[IssueType, str] = {
     IssueType.SUBOPTIMAL_TILE_SIZE: "Per-thread matrix<T,R,C> output tile suboptimal — size it to the DPAS atom (e.g. RepeatCount x 16) and EU GRF budget",
     IssueType.SUBOPTIMAL_WARPS: "SIMD width is per-instruction and follows operand width — widen vector<>/matrix<> operands so the compiler emits wider SIMD (there is no lane-count knob; DPAS runs at a fixed execution size)",
     IssueType.HIGH_REGISTER_PRESSURE: "Large vector<>/matrix<> live ranges spilling the GRF — shrink tiles or split the loop",
-    IssueType.CACHE_EVICTION_RISK: "Working set / SLM tile too large for L1/SLM — reduce block size or stage through SLM",
+    IssueType.CACHE_EVICTION_RISK: "Working set too large for L1/SLM (reduce the tile), OR the same input tile is re-read from HBM by many threads/tiles — stage the shared tile in SLM across a cooperative thread group (raise a work-group-size knob, split the load by cm_local_id, cm_slm_fence + cm_barrier) so it is fetched from HBM once per group",
     IssueType.UNCOALESCED_ACCESS: "Scattered / gather global loads — use LSC 1D block loads (cm_load by byte offset) for coalesced, cache-friendly access",
     IssueType.DTYPE_PRECISION: "Using float32 inputs/storage where bf16/half would feed DPAS (keep float accumulators), or float64 anywhere",
     IssueType.DTYPE_FLOAT64: "float64 in computation — extremely slow on Intel GPUs, use float/half/bf16",
@@ -382,8 +382,12 @@ Analyze the given CM C++ kernel and identify ALL applicable optimizations.
   SystolicDepth fixed at 8. bf16/half (CM_PRECISION_BF/HF) -> float acc;
   int8 (CM_PRECISION_S8/U8) -> int32 acc. Operands packed as uint.
 - Register tiles: vector<T,N> / matrix<T,R,C> sized to the GRF budget
-- SLM staging: cm_slm_init + cm_slm_alloc, move tiles with LSC SLM ops
-  (cm_store_slm / cm_load_slm), sync with cm_slm_fence + cm_barrier
+- SLM staging (cooperative): reuse a tile shared across a thread group — raise a
+  work-group-size knob so neighbouring tiles form one group, then cm_slm_init +
+  cm_slm_alloc, stage with the LSC SLM ops cm_store_slm/cm_load_slm (scalar byte
+  offset, power-of-two count <= 64), split the load by cm_local_id, sync with
+  cm_slm_fence(CM_GLOBAL_COHERENT_FENCE) + cm_barrier. A one-thread group makes
+  SLM/cm_barrier a no-op.
 - LSC block loads: cm_load 1D (by byte offset); assemble register tiles from
   several contiguous 1D row loads; avoid gather/scatter
 - Thread space: cm_group_id, cm_local_id, cm_linear_global_id work partitioning

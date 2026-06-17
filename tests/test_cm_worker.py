@@ -31,6 +31,7 @@ from xe_forge.core.cm_worker import RESULT_PREFIX
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SEED_GEMM = REPO_ROOT / "test_kernels" / "200_CM_Gemm.cpp"
+SLM_GEMM = REPO_ROOT / "test_kernels" / "202_CM_Gemm_SLM.cpp"
 
 
 # --------------------------------------------------------------------------- #
@@ -266,6 +267,40 @@ def test_seed_gemm_runs_and_self_compares():
     assert result.original_tflops and result.original_tflops > 0.0
     # Identical kernels: speedup hovers around 1.0 (timing noise); sanity-band it.
     assert 0.25 < result.speedup < 4.0, result.feedback_message
+
+
+@requires_intel_ocl
+def test_cooperative_slm_gemm_matches_seed():
+    """The hand-written cooperative SLM GEMM (202) matches the naive seed (200).
+
+    Proves the cooperative thread-group + SLM mechanism end-to-end: 202 forms a
+    real work group (local = (GROUP_M, 1)) and stages the shared B tile through
+    SLM, yet produces the same result as the one-thread-per-tile seed. The
+    cooperative launch grid (the local block) comes from the 202 spec; each
+    kernel's own GROUP_* #defines pick its group size (seed = 1, 202 = 4).
+    """
+    from xe_forge.core.cm_executor import CMExecutor
+    from xe_forge.core.spec_loader import load_spec
+
+    spec = load_spec(REPO_ROOT / "test_kernels" / "202_CM_Gemm_SLM.yaml")
+    executor = CMExecutor(hang_timeout=30)
+    executor.grid_spec = spec.grid
+    result = executor.compare_kernels(
+        original_path=str(SEED_GEMM),
+        optimized_path=str(SLM_GEMM),
+        dims={"M": 256, "N": 256, "K": 256},
+        input_shapes=[(256, 256), (256, 256)],
+        input_dtypes=["float16", "float16"],
+        output_shapes=[(256, 256)],
+        output_dtypes=["float32"],
+        flop=2 * 256 * 256 * 256,
+        rtol=1e-2,
+        atol=1e-2,
+    )
+
+    # 202 (optimized) is compared against the seed (original): equal => correct.
+    assert result.optimized_correct, result.feedback_message
+    assert result.optimized_time_ms and result.optimized_time_ms > 0.0
 
 
 def test_compare_kernels_without_input_shapes_fails_loud():

@@ -512,8 +512,12 @@ class CMOptimizationSignature(dspy.Signature):
       with SystolicDepth fixed at 8. bf16/half (CM_PRECISION_BF/HF) -> float
       accumulate; int8 (CM_PRECISION_S8/U8) -> int32 accumulate.
     - Register tiles: vector<T,N> / matrix<T,R,C> sized to the GRF budget
-    - SLM staging: cm_slm_init + cm_slm_alloc, move tiles with LSC SLM ops
-      (cm_store_slm / cm_load_slm), sync with cm_slm_fence + cm_barrier
+    - SLM staging (cooperative): reuse a tile shared across a thread group —
+      raise a work-group-size knob from grid_contract so neighbouring tiles
+      share one group, then cm_slm_init + cm_slm_alloc, move the shared tile with
+      the LSC SLM ops cm_store_slm/cm_load_slm (SCALAR byte offset, power-of-two
+      count <= 64), split the load by cm_local_id, and sync with
+      cm_slm_fence(CM_GLOBAL_COHERENT_FENCE) + cm_barrier. No-op at group size 1.
     - LSC block loads: cm_load<T,NElts,...>(surf, byte_offset) (1D) for
       coalesced HBM access; build register tiles from several contiguous 1D
       row loads
@@ -529,7 +533,10 @@ class CMOptimizationSignature(dspy.Signature):
       int32 accumulators); avoid double.
     FUSION: fuse elementwise post-ops (bias, activation, scale, clamp) into the
       producing kernel before the store — applies to ANY kernel, not just GEMM.
-    MEMORY_ACCESS: use LSC 1D block loads, stage reused tiles through SLM.
+    MEMORY_ACCESS: use LSC 1D block loads; when one input tile is re-read by many
+      threads, form a cooperative thread group (raise a work-group-size knob from
+      grid_contract) and stage that shared tile through SLM so it is fetched from
+      HBM once per group instead of once per thread.
     DEVICE_SPECIFIC: map matmul/conv inner loops onto DPAS (SystolicDepth=8),
       widen operands so the compiler emits wider SIMD, and size the per-thread
       tile to the GRF/EU budget of the target Xe device.
@@ -548,8 +555,12 @@ class CMOptimizationSignature(dspy.Signature):
         SAME name shown in `grid_contract`. Do NOT rename it, remove it, inline
         its literal, or turn it into a computed expression/function-like macro,
         or grid computation fails and the kernel is rejected.
-      - Keep cm_group_id(...) tile indexing consistent with these block sizes
-        (each thread owns one tile sized by these #defines).
+      - Each thread owns one output tile — index it with cm_global_id(...) so it
+        stays correct at ANY group size. Some grid_contract knobs are work-group
+        (local) sizes: raising one forms a cooperative thread group whose threads
+        can SHARE an input tile through SLM. To exploit that, partition the shared
+        load across the group by cm_local_id(...), stage it once, fence +
+        cm_barrier, then have every thread read it back.
 
     === CODE REQUIREMENTS ===
     - Must be complete, valid CM C++ with all required #include directives

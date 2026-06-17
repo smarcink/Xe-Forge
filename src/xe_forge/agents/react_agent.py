@@ -257,8 +257,10 @@ class CMOptimizationReActSignature(dspy.Signature):
        #define. DPAS runs at a fixed execution size.
     3. Register tiles: size vector<>/matrix<> to the GRF budget (avoid spill)
     4. Memory: LSC 1D block loads (cm_load by byte offset; assemble tiles from
-       contiguous 1D row loads), stage reused tiles through SLM
-       (cm_store_slm/cm_load_slm)
+       contiguous 1D row loads). For a tile shared across a thread group, form a
+       cooperative group (raise a work-group-size knob from grid_contract) and
+       stage it through SLM (cm_store_slm/cm_load_slm + cm_slm_fence + cm_barrier,
+       split by cm_local_id) so it is read from HBM once per group, not per thread
     5. Data types: bf16/half inputs with float acc, or int8 S8/U8 with int32
        acc; avoid double
     6. Unroll tight, compile-time-bounded loops with #pragma unroll
@@ -276,8 +278,12 @@ class CMOptimizationReActSignature(dspy.Signature):
         SAME name shown in `grid_contract`. Do NOT rename it, remove it, inline
         its literal, or turn it into a computed expression/function-like macro,
         or grid computation fails and the kernel is rejected.
-      - Keep cm_group_id(...) tile indexing consistent with these block sizes
-        (each thread owns one tile sized by these #defines).
+      - Each thread owns one output tile — index it with cm_global_id(...) so it
+        stays correct at ANY group size. Some grid_contract knobs are work-group
+        (local) sizes: raising one forms a cooperative thread group whose threads
+        can SHARE an input tile through SLM. To exploit that, partition the shared
+        load across the group by cm_local_id(...), stage it once, fence +
+        cm_barrier, then have every thread read it back.
 
     === CODE REQUIREMENTS ===
     - Complete, valid CM C++ with all required #include directives

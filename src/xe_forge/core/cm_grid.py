@@ -48,6 +48,13 @@ class GridConfig:
         for value, name in zip((*self.global_size, *self.local_size), names, strict=True):
             if value <= 0:
                 raise ValueError(f"{name} must be > 0, got {value}")
+        for axis, g, loc in zip("xyz", self.global_size, self.local_size, strict=True):
+            if g % loc != 0:
+                raise ValueError(
+                    f"global.{axis} ({g}) must be a whole multiple of local.{axis} "
+                    f"({loc}); the global work size must divide evenly into "
+                    f"work-groups of the local size"
+                )
 
 
 def extract_defines(kernel_source: str) -> dict[str, int]:
@@ -180,12 +187,7 @@ def compute_grid(
     global_size = _eval_axes(grid_spec, dims, defines, "global")
     local_size = _eval_axes(grid_spec.get("local"), dims, defines, "local")
 
-    for axis, g, loc in zip("xyz", global_size, local_size, strict=True):
-        if loc > g:
-            logger.warning(
-                "local.%s (%d) > global.%s (%d); runtime will clamp", axis, loc, axis, g
-            )
-
+    # GridConfig.__post_init__ enforces positivity and global%local divisibility.
     grid = GridConfig(global_size, local_size, formulas=dict(grid_spec))
     logger.info("Evaluated grid: global=%s local=%s", grid.global_size, grid.local_size)
     return grid
@@ -207,8 +209,10 @@ def describe_grid_contract(grid_spec: dict[str, Any] | None, kernel_source: str)
 
     exprs = [effective[ax] for ax in ("x", "y", "z") if ax in effective]
     formulas = [f"  global.{ax} = {effective[ax]}" for ax in ("x", "y", "z") if ax in effective]
+    local_exprs: list[Any] = []
     if local:
-        exprs += [local[ax] for ax in ("x", "y", "z") if ax in local]
+        local_exprs = [local[ax] for ax in ("x", "y", "z") if ax in local]
+        exprs += local_exprs
         formulas += [f"  local.{ax} = {local[ax]}" for ax in ("x", "y", "z") if ax in local]
 
     symbols: set[str] = set()
@@ -218,10 +222,39 @@ def describe_grid_contract(grid_spec: dict[str, Any] | None, kernel_source: str)
     knobs = sorted(s for s in symbols if s in defines)
     dims = sorted(s for s in symbols if s not in defines)
 
+    # Knobs that appear in a local (work-group size) formula are the cooperative
+    # group-size levers: raising one past 1 forms a real thread group whose
+    # members can share Shared Local Memory.
+    local_symbols: set[str] = set()
+    for expr in local_exprs:
+        local_symbols |= set(re.findall(r"[A-Za-z_]\w*", str(expr)))
+    local_knobs = {s for s in (local_symbols - _FUNCS.keys()) if s in defines}
+
     if knobs:
-        knob_lines = "\n".join(f"    {k} = {defines[k]}" for k in knobs)
+        knob_lines = "\n".join(
+            f"    {k} = {defines[k]}"
+            + ("   (work-group size: raise > 1 to form a cooperative thread group)"
+               if k in local_knobs else "")
+            for k in knobs
+        )
     else:
         knob_lines = "    (no grid-driving #define found in the current kernel)"
+
+    coop_note = ""
+    if local_knobs:
+        coop_note = (
+            "\n\nCOOPERATIVE THREAD GROUPS: the work-group-size knob(s) above ("
+            + ", ".join(sorted(local_knobs))
+            + ") set how many threads share one thread group (#groups = global / local). "
+            "At size 1 each thread runs alone, so Shared Local Memory and cm_barrier do "
+            "nothing. Raise a work-group-size knob to make the threads in a group "
+            "cooperate: partition the shared input tile across them by cm_local_id(...), "
+            "stage it once in SLM (cm_store_slm / cm_load_slm) with cm_slm_fence + "
+            "cm_barrier, then let every thread read it back — eliminating redundant global "
+            "loads. Index each thread's own output tile with cm_global_id(...) (= "
+            "cm_group_id * GROUP + cm_local_id) so it stays correct at any group size; a "
+            "group then owns several adjacent tiles that share an input sub-tile."
+        )
 
     return (
         "The harness computes the launch grid from these formulas (you never set the "
@@ -236,6 +269,7 @@ def describe_grid_contract(grid_spec: dict[str, Any] | None, kernel_source: str)
         "above — do NOT rename it, remove it, inline its value, or turn it into an expression "
         "or function-like macro, or the grid can no longer be computed and the kernel is "
         "rejected."
+        + coop_note
     )
 
 
