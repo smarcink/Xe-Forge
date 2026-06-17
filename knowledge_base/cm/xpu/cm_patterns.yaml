@@ -152,7 +152,7 @@ patterns:
       parallelism so loads and DPAS pipeline together.
       Consequences: more unrolling means a larger instruction footprint and
       more simultaneously-live values, which raises GRF pressure and can cause
-      register spills that collapse performance (see cm_grf_register_spill).
+      register spills that collapse performance (see cm_register_file_budget).
       When useful: tight inner loops with small, fixed bounds — e.g. the K/TILE_K
       DPAS loop and tile-chunk loops. Prefer #pragma nounroll or a small
       partial factor for long or runtime-bounded loops.
@@ -247,18 +247,63 @@ patterns:
     expected_speedup: "1.2-1.5x when the epilogue is memory-bound"
     applies_to: [gemm, conv, reduction, elementwise, activation, ffn, any]
 
+  - id: cm_grf_register_file_size
+    name: "Size the per-thread register working set to the GRF budget"
+    stage: autotuning
+    before: |
+      // The GRF cost of a register-blocked kernel is the SUM of every
+      // simultaneously-live vector<>/matrix<> object, not a single tile:
+      //   acc : matrix<float, 32, 64> = 32*64*4 = 8192 B
+      //   a   : matrix<half,  32, 32> = 32*32*2 = 2048 B
+      //   b   : matrix<half,  32, 64> = 32*64*2 = 4096 B
+      // working set ~14 KB, which exceeds the ~4-8 KB default register budget
+      // (see the cm_register_file_budget constraint), so this spills.
+      matrix<float, 32, 64> acc = 0.0f;
+    after: |
+      // Either shrink the tile so the working set fits the budget, or raise the
+      // register file to 256 registers (double the budget) when the bigger tile
+      // is worth the lower occupancy. A single small tile like this one is only
+      // 16*32*4 = 2048 B — it fits the default budget easily and does NOT need
+      // large GRF.
+      matrix<float, 16, 32> acc = 0.0f;
+    description: |
+      The register-file size is selected by the -Qxcm_register_file_size build
+      option (not a source construct): 128 registers by default, or 256 in
+      "large GRF" mode. Sweep it as a "grf" knob TOGETHER with the tile/block
+      sizes, because the two interact: a larger register file lets a big
+      register-blocked tile stay resident instead of spilling, but it halves the
+      number of resident threads (lower occupancy and latency hiding). Use the
+      per-thread budget accounting (see the cm_register_file_budget constraint)
+      to judge whether a given tile actually needs the larger file. Allowed
+      values are platform-dependent (see cm_autotune_register_file_size_values).
+    rationale: "A bigger register file trades occupancy for capacity, so it only helps tiles whose live set spills the default budget; pairing it with the tile size and measuring is the only way to know."
+    expected_speedup: "1.1-2x for register-blocked GEMM/DPAS kernels that spill at the default register-file size"
+    applies_to: [gemm, matmul, conv, dpas, reduction, any]
+
 constraints:
   - id: cm_dtype_float64_forbidden
     name: "Avoid float64 (double) in CM kernels"
     description: "Double precision is extremely slow on Intel GPUs; use float/half/bfloat16."
     severity: critical
 
-  - id: cm_grf_register_spill
-    name: "Keep register tiles within the GRF budget"
+  - id: cm_register_file_budget
+    name: "Compute the per-thread register budget and keep the live tile set within it"
     description: |
-      Oversized vector<>/matrix<> live ranges spill to memory and collapse
-      performance. Size per-thread tiles to the EU GRF budget (and chosen GRF
-      mode); reduce tile size or split the K-loop if spilling occurs.
+      Every vector<>/matrix<> object lives in the thread's General Register
+      File; a live working set larger than the budget spills to memory and
+      collapses performance. The per-thread budget is (register count) x
+      (register width):
+        - register count = 128 by default, or 256 in "large GRF" mode (selected
+          by the -Qxcm_register_file_size build option);
+        - register width = 32 B on Xe-LP / Xe-HPG (Arc, Alchemist, and the
+          Xe-LPG iGPU in Meteor / Arrow Lake), 64 B on Xe-HPC (PVC) and Xe2+.
+      So the default budget is ~4 KB (32 B/reg) or ~8 KB (64 B/reg); large-GRF
+      mode doubles it. Estimate usage as the SUM of all simultaneously-live
+      tiles (accumulator + operands + unrolled temporaries), each elements x
+      dtype bytes, and keep that total under the budget. A single small tile
+      rarely spills; spills come from large register-blocked working sets. If a
+      kernel spills, shrink the tile, split the K-loop, or raise the
+      register-file size (at the cost of occupancy).
     severity: critical
 
   - id: cm_coalesced_contiguous_access
@@ -285,3 +330,17 @@ constraints:
       forms (cm_load4 / per-lane offsets) have no such restriction but coalesce
       worse — prefer the packed block load.
     severity: critical
+
+  - id: cm_autotune_register_file_size_values
+    name: "-Qxcm_register_file_size only accepts platform-specific values"
+    description: |
+      The GRF register-file size (-Qxcm_register_file_size=<value>) must be one
+      of the values the target platform supports; an unsupported value fails the
+      build. Allowed values:
+        - pre-XeHP (Gen12LP / Xe-LP, e.g. TGL, DG1): 128 only.
+        - XeHP through Xe2 (Xe-HPG/Alchemist/DG2, Xe-HPC/PVC, Xe-LPG/Meteor &
+          Arrow Lake, Xe2/Battlemage): 128, 256, or auto.
+        - Xe3 and later: 32, 64, 96, 128, 160, 192, 256, or auto.
+      When the exact architecture is unknown, 128 (default) and 256 ("large
+      GRF") are valid on every XeHP-and-later part.
+    severity: warning
