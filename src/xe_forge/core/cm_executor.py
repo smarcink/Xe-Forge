@@ -28,6 +28,7 @@ from ai_bench.harness.runner.benchmark_compare import set_all_seeds
 from xe_forge.core.cm_compiler import CMCompiler, CMRunResult
 from xe_forge.core.cm_grid import compute_grid, parse_build_directives
 from xe_forge.core.sycl_executor import _save_tensor
+from xe_forge.core.xpu_query import xmx_enabled
 from xe_forge.models import ExecutionResult
 
 logger = logging.getLogger(__name__)
@@ -37,35 +38,26 @@ logger = logging.getLogger(__name__)
 class CMDeviceCaps:
     """Hardware features that gate which CM codegen patterns are usable.
 
-    Read from ``torch.xpu`` device properties (the same stable hardware flags
-    used for target detection). Defaults are optimistic (``True``): when no live
-    XPU can be queried we keep prior behavior and assume DPAS is available. Only
-    a live device that explicitly reports a missing feature flips a flag off —
-    so DPAS codegen is suppressed *only* when we positively know the target
-    lacks it (e.g. Xe-LPG / Meteor Lake / Arrow Lake, which have no XMX
-    systolic array).
+    DPAS is assumed available on every Intel Xe target: the driver's
+    ``has_subgroup_matrix_multiply_accumulate`` flag is unreliable (under-reported
+    on some Battlemage runtime builds) and is deliberately not consulted. The
+    DPAS path is suppressed only when explicitly opted out via the
+    ``XE_FORGE_NO_XMX`` env var — e.g. to target Xe-LPG / Meteor Lake / Arrow
+    Lake, which have no XMX systolic array.
     """
 
-    has_dpas: bool = True  # XMX systolic matmul (cm_dpas) — has_subgroup_matrix_multiply_accumulate
-    queried: bool = False  # True only when a live XPU was actually inspected
+    has_dpas: bool = True  # XMX systolic matmul (cm_dpas); opt out via XE_FORGE_NO_XMX
 
 
 def _detect_device_capabilities() -> CMDeviceCaps:
-    """Detect XMX/DPAS support from the live XPU device.
+    """Resolve XMX/DPAS availability for CM codegen.
 
-    Returns optimistic defaults (everything available) when no XPU is present or
-    the properties are missing, so the compile-only/offline path is unaffected.
+    DPAS is assumed available rather than probed from the buggy driver flag; opt
+    into the no-DPAS path (vector FMA / dp4a) with ``XE_FORGE_NO_XMX=1``.
     """
-    try:
-        if not hasattr(torch, "xpu") or not torch.xpu.is_available():
-            return CMDeviceCaps()
-        props = torch.xpu.get_device_properties(torch.xpu.current_device())
-        has_dpas = bool(getattr(props, "has_subgroup_matrix_multiply_accumulate", True))
-        logger.info("CM device capabilities: XMX/DPAS=%s", "yes" if has_dpas else "NO")
-        return CMDeviceCaps(has_dpas=has_dpas, queried=True)
-    except Exception as e:
-        logger.debug("CM device capability detection failed: %s", e)
-        return CMDeviceCaps()
+    has_dpas = xmx_enabled()
+    logger.info("CM device capabilities: XMX/DPAS=%s", "yes" if has_dpas else "NO")
+    return CMDeviceCaps(has_dpas=has_dpas)
 
 
 # --- Input/output dtype handling -------------------------------------------

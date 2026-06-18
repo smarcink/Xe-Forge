@@ -6,11 +6,30 @@ Queries Intel GPU/XPU hardware information to pass optimal parameters to the opt
 
 import json
 import logging
+import os
 import subprocess
 from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def xmx_enabled() -> bool:
+    """Whether to use the XMX/DPAS systolic-array path (default: yes).
+
+    XMX/DPAS is assumed available on every Intel Xe target rather than probed
+    from the driver, whose ``has_subgroup_matrix_multiply_accumulate`` flag is
+    unreliable: some Level-Zero V2 / oneAPI Unified Runtime builds on Battlemage
+    (Arc B-series, e.g. device 0xE20B) report it ``False`` even though the
+    silicon has XMX. To target a device that genuinely lacks the systolic array
+    (Xe-LPG / Meteor Lake / Arrow Lake), opt into the no-DPAS path by setting
+    ``XE_FORGE_NO_XMX=1`` (or true/yes/on) — codegen then falls back to vector
+    FMA (float/half) or dp4a (int8).
+    """
+    raw = os.getenv("XE_FORGE_NO_XMX")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -100,8 +119,11 @@ def query_xpu_via_torch() -> XPUDeviceInfo | None:
                 info.has_fp64 = props.has_fp64
             if hasattr(props, "has_fp16"):
                 info.has_fp16 = props.has_fp16
-            if hasattr(props, "has_subgroup_matrix_multiply_accumulate"):
-                info.has_xmx = bool(props.has_subgroup_matrix_multiply_accumulate)
+            # has_xmx is intentionally NOT read from
+            # props.has_subgroup_matrix_multiply_accumulate: that driver flag is
+            # unreliable (under-reported on some Battlemage builds). XMX is
+            # assumed available and only disabled via XE_FORGE_NO_XMX — see
+            # xmx_enabled(), applied below.
 
             # Store raw properties
             for attr in dir(props):
@@ -115,6 +137,10 @@ def query_xpu_via_torch() -> XPUDeviceInfo | None:
         if hasattr(torch.xpu, "get_device_capability"):
             cap = torch.xpu.get_device_capability(info.device_id)
             info.raw_properties["capability"] = cap
+
+        # XMX/DPAS is assumed available (the driver flag is buggy); opt into the
+        # no-DPAS path with XE_FORGE_NO_XMX=1.
+        info.has_xmx = xmx_enabled()
 
         # Infer architecture-specific recommendations
         info = _set_recommendations(info)
