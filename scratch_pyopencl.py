@@ -349,11 +349,20 @@ def run_cm_gemm(ctx: cl.Context, queue: cl.CommandQueue, prg: cl.Program,
         kernel(queue, gsize, lsize, *kargs)
     queue.finish()
 
+    # Report MIN (not mean) as the headline. On this iGPU the per-iter time swings
+    # with DVFS/boost ramp and any background GPU work, so the MEAN of a short run
+    # is unstable (the same kernel measured 155 vs 260 ms across two sessions). The
+    # MIN iter is the one that hit peak clock with least interference -- it is the
+    # most reproducible estimate of true kernel cost and what clpeak/good
+    # microbenchmarks report. median + mean are printed too so the spread is visible.
     iters = max(1, iters)
     events = [kernel(queue, gsize, lsize, *kargs) for _ in range(iters)]
     queue.finish()
-    mean_ms = sum(e.profile.end - e.profile.start for e in events) / iters * 1e-6
-    tflops = (2.0 * M * N * K) / (mean_ms * 1e-3) / 1e12
+    per_ms = sorted((e.profile.end - e.profile.start) * 1e-6 for e in events)
+    min_ms = per_ms[0]
+    median_ms = per_ms[len(per_ms) // 2]
+    mean_ms = sum(per_ms) / iters
+    tflops = (2.0 * M * N * K) / (min_ms * 1e-3) / 1e12  # headline TFLOPS uses MIN
 
     d = np.empty((M, N), d_dtype)
     cl.enqueue_copy(queue, d, d_g)
@@ -374,8 +383,9 @@ def run_cm_gemm(ctx: cl.Context, queue: cl.CommandQueue, prg: cl.Program,
     rel = max_err / (float(np.max(np.abs(rv))) + 1e-12)
     ok = cos > 0.999  # direction match; robust to fp16-accumulation drift
     print(f"cm_gemm {M}x{N}x{K}  grid={gsize} local={lsize}  "
-          f"mean={mean_ms:.3f} ms/iter ({iters} iters)  {tflops:.3f} TFLOPS  "
-          f"cos={cos:.6f} max_err={max_err:.4f} rel={rel:.2e}  match={ok}")
+          f"min={min_ms:.3f} median={median_ms:.3f} mean={mean_ms:.3f} ms/iter "
+          f"({iters} iters, {warmup} warmup)  {tflops:.3f} TFLOPS(min)  "
+          f"cos={cos:.6f} rel={rel:.2e}  match={ok}")
     return 0 if ok else 1
 
 
@@ -399,8 +409,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--k", type=int, default=256, help="GEMM K (default 256)")
     ap.add_argument("--iters", type=int, default=20,
                     help="timed iterations for --cm (default 20)")
-    ap.add_argument("--warmup", type=int, default=3,
-                    help="warmup iterations for --cm (default 3)")
+    ap.add_argument("--warmup", type=int, default=10,
+                    help="warmup iterations for --cm (default 10; lets the GPU "
+                         "reach steady boost clock before timing)")
     ap.add_argument("--saxpy", action="store_true",
                     help="run an OpenCL-C SAXPY stack smoke test")
     ap.add_argument("--saxpy-n", type=int, default=1 << 20,
