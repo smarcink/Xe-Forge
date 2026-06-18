@@ -12,13 +12,9 @@ cm_gemm(SurfaceIndex surfA [[type("buffer_t")]],
         SurfaceIndex surfB [[type("buffer_t")]],
         SurfaceIndex surfD [[type("buffer_t")]],
         int M, int N, int K) {
-  // cm_global_id == cm_group_id * GROUP + cm_local_id, so each thread owns one
-  // distinct BLOCK_M x BLOCK_N output tile whatever the group size is (identical
-  // to cm_group_id when GROUP_M = GROUP_N = 1).
   const int tm = cm_global_id(0) * BLOCK_M;
   const int tn = cm_global_id(1) * BLOCK_N;
 
-  // Accumulate the output tile in float for accuracy.
   matrix<half, BLOCK_M, BLOCK_N> acc = 0.0f;
 
   for (int k0 = 0; k0 < K; k0 += BLOCK_K) {

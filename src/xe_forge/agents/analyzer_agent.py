@@ -658,7 +658,14 @@ class AnalyzerAgent:
         if target_dtype:
             lines.append(f"TARGET DTYPE: {target_dtype}")
             lines.append(
-                f"Kernel should use {target_dtype} for inputs/outputs and accumulate in float32"
+                f"Use {target_dtype} for the inputs/outputs the spec declares. "
+                "ACCUMULATOR precision is a SEPARATE choice: a wider accumulator "
+                "(e.g. float32 for half/bfloat16 inputs) is the safe default and "
+                "limits rounding error over long reductions — but if the kernel "
+                "and spec DELIBERATELY use a narrower accumulator (e.g. half) and "
+                "it still meets the spec's correctness tolerance, RESPECT that "
+                "choice and do NOT flag it as a precision bug. The spec's declared "
+                "output dtype, not a fixed convention, decides what is required."
             )
             lines.append("")
 
