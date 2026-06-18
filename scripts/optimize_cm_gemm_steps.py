@@ -468,18 +468,174 @@ cm_gemm(SurfaceIndex surfA [[type("buffer_t")]],
 """
 
 
+# ===========================================================================
+# LSC 2D block loads (stateless svmptr_t; hardware VNNI for B; natural layout)
+# ===========================================================================
+# The hardware addresses each tile from a 2D surface descriptor and (for B)
+# applies the VNNI transform in-flight, so NO offline packing is needed. One
+# normal 2D load fetches the whole BLOCK_M x DPAS_K A panel; one VNNI 2D load
+# per column-atom fetches a DPAS-ready B atom. Message count for 32x64 drops to
+# 1 (A) + NB (B) per k-step vs 12 for the offline-packed 1D path -- this tests
+# whether fewer/larger hardware-addressed messages beat the hand-packed loads.
+# Requires CM_HAS_LSC_UNTYPED_2D (verified present on BMG) + -DCM_PTRSIZE=64.
+_K_BODY_2D = """
+extern "C" _GENX_MAIN_ void
+cm_gemm(svmptr_t A, svmptr_t B, svmptr_t D, int M, int N, int K) {
+  half *pA = (half *)A;
+  half *pB = (half *)B;
+  half *pD = (half *)D;
+  const int tm = cm_global_id(0) * BLOCK_M;
+  const int tn = cm_global_id(1) * BLOCK_N;
+
+  // 2D surface descriptors (bytes-1 / elems-1 per the LSC spec).
+  const unsigned aW = (unsigned)(K * 2) - 1, aH = (unsigned)M - 1, aP = (unsigned)(K * 2) - 1;
+  const unsigned bW = (unsigned)(N * 2) - 1, bH = (unsigned)K - 1, bP = (unsigned)(N * 2) - 1;
+  const unsigned dW = (unsigned)(N * 2) - 1, dH = (unsigned)M - 1, dP = (unsigned)(N * 2) - 1;
+
+  vector<float, RPT * DPAS_N> acc[MB][NB];
+  #pragma unroll
+  for (int mb = 0; mb < MB; mb++)
+    #pragma unroll
+    for (int nb = 0; nb < NB; nb++)
+      acc[mb][nb] = 0.0f;
+
+  for (int k0 = 0; k0 < K; k0 += DPAS_K) {
+    // A: one normal 2D load of the whole BLOCK_M x DPAS_K panel (row-major).
+    // X = k0 (K offset), Y = tm (M offset).
+    vector<half, BLOCK_M * DPAS_K> ablk =
+        cm_ptr_load<half, DPAS_K, BLOCK_M, 1, false, false>(pA, aW, aH, aP, k0, tm);
+
+    vector<uint, RPT*DPAS_K/2> apk[MB];
+    #pragma unroll
+    for (int mb = 0; mb < MB; mb++)
+      apk[mb] = ablk.select<RPT * DPAS_K, 1>(mb * RPT * DPAS_K).format<uint>();
+
+    // B: one VNNI-transform 2D load per column-atom -> DPAS-ready Src1.
+    // X = tn + nb*DPAS_N (N offset), Y = k0 (K offset).
+    vector<uint, (DPAS_K/2)*DPAS_N> bpk[NB];
+    #pragma unroll
+    for (int nb = 0; nb < NB; nb++) {
+      vector<half, DPAS_K * DPAS_N> braw =
+          cm_ptr_load<half, DPAS_N, DPAS_K, 1, false, true>(
+              pB, bW, bH, bP, tn + nb * DPAS_N, k0);
+      bpk[nb] = braw.format<uint>();
+    }
+
+    #pragma unroll
+    for (int nb = 0; nb < NB; nb++)
+      #pragma unroll
+      for (int mb = 0; mb < MB; mb++)
+        acc[mb][nb] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SD, RPT>(
+            acc[mb][nb], bpk[nb], apk[mb]);
+  }
+
+  // Store: convert fp32 acc -> half, one 2D block store per atom (8 x 16).
+  #pragma unroll
+  for (int mb = 0; mb < MB; mb++)
+    #pragma unroll
+    for (int nb = 0; nb < NB; nb++) {
+      vector<half, RPT * DPAS_N> outv = acc[mb][nb];
+      cm_ptr_store<half, DPAS_N, RPT>(
+          pD, dW, dH, dP, tn + nb * DPAS_N, tm + mb * RPT, outv);
+    }
+}
+"""
+
+
+# Descriptor-based 2D load: build the block_2d_desc ONCE (base + surface dims =
+# the costly 16-dword descriptor setup) and only update the X/Y block coords per
+# use, per the spec's "initialize once, use many times -> removes extra MOVs".
+# This is the fair, optimized form of the 2D-load path vs the function form
+# (cm_ptr_load) that rebuilds the descriptor on every call.
+_K_BODY_2D_DESC = """
+extern "C" _GENX_MAIN_ void
+cm_gemm(svmptr_t A, svmptr_t B, svmptr_t D, int M, int N, int K) {
+  half *pA = (half *)A;
+  half *pB = (half *)B;
+  half *pD = (half *)D;
+  const int tm = cm_global_id(0) * BLOCK_M;
+  const int tn = cm_global_id(1) * BLOCK_N;
+
+  const unsigned dW = (unsigned)(N * 2) - 1, dH = (unsigned)M - 1, dP = (unsigned)(N * 2) - 1;
+
+  // Descriptors built once: ctor(ptr, Height-1[elems], Width-1[bytes],
+  // Pitch-1[bytes], BlockX, BlockY). A: BLOCK_M x DPAS_K normal; B: DPAS_K x
+  // DPAS_N VNNI. Only the K (and B's N) block coords change inside the loop.
+  lsc::block_2d_desc<half, 1, BLOCK_M, DPAS_K> aDesc(
+      pA, (unsigned)M - 1, (unsigned)(K * 2) - 1, (unsigned)(K * 2) - 1, 0, tm);
+  lsc::block_2d_desc<half, 1, DPAS_K, DPAS_N> bDesc(
+      pB, (unsigned)K - 1, (unsigned)(N * 2) - 1, (unsigned)(N * 2) - 1, 0, 0);
+
+  vector<float, RPT * DPAS_N> acc[MB][NB];
+  #pragma unroll
+  for (int mb = 0; mb < MB; mb++)
+    #pragma unroll
+    for (int nb = 0; nb < NB; nb++)
+      acc[mb][nb] = 0.0f;
+
+  for (int k0 = 0; k0 < K; k0 += DPAS_K) {
+    aDesc.set_block_x(k0);
+    vector<half, BLOCK_M * DPAS_K> ablk;
+    cm_load<lsc::Normal>(ablk, aDesc);
+
+    vector<uint, RPT*DPAS_K/2> apk[MB];
+    #pragma unroll
+    for (int mb = 0; mb < MB; mb++)
+      apk[mb] = ablk.select<RPT * DPAS_K, 1>(mb * RPT * DPAS_K).format<uint>();
+
+    bDesc.set_block_y(k0);
+    vector<uint, (DPAS_K/2)*DPAS_N> bpk[NB];
+    #pragma unroll
+    for (int nb = 0; nb < NB; nb++) {
+      bDesc.set_block_x(tn + nb * DPAS_N);
+      vector<half, DPAS_K * DPAS_N> braw;
+      cm_load<lsc::VNNI>(braw, bDesc);
+      bpk[nb] = braw.format<uint>();
+    }
+
+    #pragma unroll
+    for (int nb = 0; nb < NB; nb++)
+      #pragma unroll
+      for (int mb = 0; mb < MB; mb++)
+        acc[mb][nb] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SD, RPT>(
+            acc[mb][nb], bpk[nb], apk[mb]);
+  }
+
+  #pragma unroll
+  for (int mb = 0; mb < MB; mb++)
+    #pragma unroll
+    for (int nb = 0; nb < NB; nb++) {
+      vector<half, RPT * DPAS_N> outv = acc[mb][nb];
+      cm_ptr_store<half, DPAS_N, RPT>(
+          pD, dW, dH, dP, tn + nb * DPAS_N, tm + mb * RPT, outv);
+    }
+}
+"""
+
+
 def gen_kernel(bm: int, bn: int, *, offline_A: bool, offline_B: bool,
                prefetch: bool = False, prefetch_a: bool | None = None,
                prefetch_b: bool | None = None, slm: bool = False,
+               twod: bool = False, twod_desc: bool = False,
                gm: int = 1, gn: int = 1) -> str:
     """Emit a CM GEMM variant for the given tile + offline-pack / pipeline flags.
 
     ``prefetch=True`` is shorthand for prefetching BOTH operands; ``prefetch_a``
     / ``prefetch_b`` override that to pipeline a single operand (the rest load
     synchronously). ``slm=True`` emits the cooperative-group variant that stages
-    both operands through SLM (requires gm*gn > 1). Any pipelined or SLM variant
-    requires offline-packed A and B.
+    both operands through SLM (requires gm*gn > 1). ``twod=True`` emits the LSC
+    2D-block-load variant (stateless svmptr_t args, hardware VNNI for B, natural
+    A/B layout -- no offline pack); ``twod_desc=True`` is the descriptor-based
+    form of that (builds the 2D descriptor once and only updates block coords).
+    Any pipelined or SLM variant requires offline-packed A and B.
     """
+    if twod or twod_desc:
+        assert not (offline_A or offline_B), "2D variant uses NATURAL layout"
+        assert bm <= 32, "A normal 2D load Height (=BLOCK_M) must be <= 32"
+        body = _K_BODY_2D_DESC if twod_desc else _K_BODY_2D
+        src = _K_DEFINES + body
+        return (src.replace("__BM__", str(bm)).replace("__BN__", str(bn))
+                .replace("__GM__", str(gm)).replace("__GN__", str(gn)))
     if slm:
         assert offline_A and offline_B, "SLM variant assumes offline A and B"
         assert gm * gn > 1, "SLM variant needs a real thread group (gm*gn > 1)"
@@ -511,7 +667,8 @@ def gen_kernel(bm: int, bn: int, *, offline_A: bool, offline_B: bool,
 # ===========================================================================
 class Stage:
     def __init__(self, key, title, story, *, source=None, gen=None,
-                 offline_A=False, offline_B=False, regfile=128, ref=None):
+                 offline_A=False, offline_B=False, regfile=128, ref=None,
+                 extra_opts=""):
         self.key = key
         self.title = title
         self.story = story
@@ -520,6 +677,9 @@ class Stage:
         self.offline_A = offline_A
         self.offline_B = offline_B
         self.regfile = regfile
+        # extra clBuildProgram options appended for this stage (e.g. the 2D
+        # variant needs -DCM_PTRSIZE=64 for its stateless svmptr_t args).
+        self.extra_opts = extra_opts
         # key of the stage this one builds on, for an honest step-speedup. None
         # => the previous stage (a linear story). Exploratory BRANCH stages set
         # this so their step compares to their real parent, not whatever probe
@@ -680,6 +840,39 @@ def build_stages(baseline_src: str) -> list[Stage]:
                                    slm=True, gm=2, gn=2),
             offline_A=True, offline_B=True, regfile=256, ref="04_kprefetch",
         ),
+        Stage(
+            "14_2d_32x64", "LSC 2D block loads + HW VNNI (32x64) + 256-GRF",
+            "Lift the 1D-load constraint: use the LSC untyped 2D block-load "
+            "engine. A is loaded as one normal 2D block (whole BLOCK_M x DPAS_K "
+            "panel, hardware-addressed); B uses the 2D VNNI-TRANSFORM load so the "
+            "DPAS-ready Src1 is produced in-flight from NATURAL [K,N] B -- NO "
+            "offline packing at all. Message count drops to 1 A + NB B per k-step "
+            "(5 for 32x64) vs 12 hand-packed 1D loads. Stateless svmptr_t args "
+            "(-DCM_PTRSIZE=64). Tests whether fewer/larger HW-addressed messages "
+            "beat the offline-pack + 1D-load best (58 TF). Same 32x64 / 256-GRF.",
+            gen=lambda: gen_kernel(32, 64, offline_A=False, offline_B=False,
+                                   twod=True),
+            offline_A=False, offline_B=False, regfile=256, ref="05_tile32x64",
+            extra_opts="-DCM_PTRSIZE=64",
+        ),
+        Stage(
+            "15_2d_16x64", "LSC 2D block loads + HW VNNI (16x64) + 256-GRF",
+            "The 2D-load engine at the smaller 16x64 tile (more resident threads "
+            "/ higher occupancy). Compared against the 1D-load 16x64 pipeline "
+            "(stage 4) to isolate the 2D-load effect at matched tile, and against "
+            "stage 14 to see how the 2D path scales with tile size.",
+            gen=lambda: gen_kernel(16, 64, offline_A=False, offline_B=False,
+                                   twod=True),
+            offline_A=False, offline_B=False, regfile=256, ref="04_kprefetch",
+            extra_opts="-DCM_PTRSIZE=64",
+        ),
+        # NOTE: a descriptor-reuse 2D variant (build the block_2d_desc once,
+        # update only block coords) was implemented (gen_kernel twod_desc=True,
+        # _K_BODY_2D_DESC) to give the 2D path its best shot. It COMPILES but
+        # faults at runtime (clFinish OUT_OF_RESOURCES = GPU memory fault) due to
+        # a CM block_2d_desc API subtlety. It is left out of the run to avoid
+        # risking a display TDR; the validated function-form stage 14 stands as
+        # the 2D verdict (41.7 TF < the 58 TF offline-packed best).
     ]
 
 
@@ -723,6 +916,8 @@ def bench_stage(cl, ctx, stage: Stage, src: str, *, M, N, K,
     opts = f"-cmc -Qxcm_register_file_size={stage.regfile}"
     if jit_target:
         opts += f" -Qxcm_jit_target={jit_target}"
+    if stage.extra_opts:
+        opts += f" {stage.extra_opts}"
 
     try:
         prg = cl.Program(ctx, src).build(options=opts)
