@@ -62,6 +62,9 @@ _MAPPING: dict[IssueType, OptimizationStage] = {
     IssueType.CACHE_EVICTION_RISK: OptimizationStage.MEMORY_ACCESS,
     IssueType.LONG_LIVENESS: OptimizationStage.MEMORY_ACCESS,
     IssueType.HIGH_REGISTER_PRESSURE: OptimizationStage.MEMORY_ACCESS,
+    # COMPUTE INTENSITY / OCCUPANCY (generic GPU)
+    IssueType.MISSING_REGISTER_BLOCKING: OptimizationStage.MEMORY_ACCESS,
+    IssueType.LOW_OCCUPANCY: OptimizationStage.DEVICE_SPECIFIC,
     # BLOCK POINTERS
     IssueType.MANUAL_POINTER_ARITHMETIC: OptimizationStage.BLOCK_POINTERS,
     IssueType.BLOCK_PTR_BOUNDARY_WRONG: OptimizationStage.BLOCK_POINTERS,
@@ -141,6 +144,8 @@ _KEYWORD_RULES: list[tuple[str, OptimizationStage]] = [
     ("cache_eviction", OptimizationStage.MEMORY_ACCESS),
     ("liveness", OptimizationStage.MEMORY_ACCESS),
     ("register_pressure", OptimizationStage.MEMORY_ACCESS),
+    ("register_blocking", OptimizationStage.MEMORY_ACCESS),
+    ("register_tiling", OptimizationStage.MEMORY_ACCESS),
     ("memory_access", OptimizationStage.MEMORY_ACCESS),
     ("memory_layout", OptimizationStage.MEMORY_ACCESS),
     ("memory_coalesce", OptimizationStage.MEMORY_ACCESS),
@@ -163,6 +168,7 @@ _KEYWORD_RULES: list[tuple[str, OptimizationStage]] = [
     ("serialized_n", OptimizationStage.DEVICE_SPECIFIC),
     ("sigmoid", OptimizationStage.DEVICE_SPECIFIC),
     ("exp2", OptimizationStage.DEVICE_SPECIFIC),
+    ("occupancy", OptimizationStage.DEVICE_SPECIFIC),
     ("autotune_duplicate", OptimizationStage.AUTOTUNING),
     ("autotune", OptimizationStage.AUTOTUNING),
     ("warp", OptimizationStage.DEVICE_SPECIFIC),

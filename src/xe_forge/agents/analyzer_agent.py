@@ -64,6 +64,10 @@ _SYCL_SKIP_ISSUES: set[IssueType] = {
     IssueType.DEVICE_HOST_SYNC,
     IssueType.NON_CONTIGUOUS_INPUT,
     IssueType.TRANSPOSE_IN_LOOP,
+    # Register blocking / occupancy are raw-GPU concerns; the SYCL/CUTLASS path
+    # expresses them through TileShape / PipelineStages, not directly.
+    IssueType.MISSING_REGISTER_BLOCKING,
+    IssueType.LOW_OCCUPANCY,
 }
 
 
@@ -71,16 +75,18 @@ _SYCL_SKIP_ISSUES: set[IssueType] = {
 # vector+matrix registers, the DPAS systolic array, SLM, and thread/group ids
 # directly. The descriptions below re-cast generic issue types in CM terms.
 _CM_DESCRIPTIONS: dict[IssueType, str] = {
-    IssueType.SUBOPTIMAL_TILE_SIZE: "Per-thread matrix<T,R,C> output tile suboptimal — size it to the DPAS atom (e.g. RepeatCount x 16) and EU GRF budget",
+    IssueType.SUBOPTIMAL_TILE_SIZE: "Per-thread matrix<T,R,C> output tile suboptimal — if the device has DPAS/XMX, align it to the DPAS atom (e.g. RepeatCount x 16); otherwise size it for register reuse, the EU GRF budget, and occupancy. Pair with autotuning to measure candidates",
     IssueType.SUBOPTIMAL_WARPS: "SIMD width is per-instruction and follows operand width — widen vector<>/matrix<> operands so the compiler emits wider SIMD (there is no lane-count knob; DPAS runs at a fixed execution size)",
     IssueType.HIGH_REGISTER_PRESSURE: "Large vector<>/matrix<> live ranges spilling the GRF — shrink tiles or split the loop",
-    IssueType.CACHE_EVICTION_RISK: "Working set too large for L1/SLM (reduce the tile), OR the same input tile is re-read from HBM by many threads/tiles — stage the shared tile in SLM across a cooperative thread group (raise a work-group-size knob, split the load by cm_local_id, cm_slm_fence + cm_barrier) so it is fetched from HBM once per group",
+    IssueType.MISSING_REGISTER_BLOCKING: "Each loaded A/B element feeds too few MACs — hold a larger per-thread matrix<> output tile in registers and reuse each loaded operand across the tile (register/output blocking). Works with or without DPAS; raises arithmetic intensity. Size against the GRF budget (see cm_register_file_budget) and let autotuning pick the tile — bigger tiles reuse more but lower occupancy and risk spills",
+    IssueType.LOW_OCCUPANCY: "Too few resident EU threads to hide memory + instruction latency — usually oversized per-thread tiles, large GRF, or heavy SLM use. Balance per-thread resources against resident-thread count; the sweet spot is hardware-dependent, so sweep it in autotuning (smaller tile / default GRF = more threads; larger tile / large GRF = fewer)",
+    IssueType.CACHE_EVICTION_RISK: "Working set too large for L1/SLM (reduce the tile), OR the same input tile is re-read from HBM by many threads. Staging the shared tile in SLM across a cooperative thread group CAN cut HBM traffic — but MEASURE: on hardware with a strong L2 the cache may already capture this reuse, and SLM adds cm_slm_fence + cm_barrier sync cost, so it only wins with a real thread group when reuse exceeds what the cache already provides",
     IssueType.UNCOALESCED_ACCESS: "Scattered / gather global loads — use LSC 1D block loads (cm_load by byte offset) for coalesced, cache-friendly access",
-    IssueType.DTYPE_PRECISION: "Using float32 inputs/storage where bf16/half would feed DPAS (keep float accumulators), or float64 anywhere",
+    IssueType.DTYPE_PRECISION: "Using float32 inputs/storage where bf16/half suffices — narrower types halve memory traffic, widen SIMD packing, and feed DPAS if the device has XMX (keep float accumulators unless reduced precision is acceptable); float64 anywhere is very slow",
     IssueType.DTYPE_FLOAT64: "float64 in computation — extremely slow on Intel GPUs, use float/half/bf16",
     IssueType.UNFUSED_ELEMENTWISE: "Elementwise epilogue (bias/activation) not fused into the kernel before the final store",
     IssueType.UNFUSED_KERNELS: "Multiple CM kernel enqueues that could be fused into one",
-    IssueType.SUBOPTIMAL_ALGORITHM: "Naive loop where a DPAS-based or blocked formulation is faster",
+    IssueType.SUBOPTIMAL_ALGORITHM: "Naive loop where a register-blocked / tiled formulation is faster (or a DPAS-based one if the device has XMX)",
     IssueType.REDUNDANT_COMPUTATION: "Repeated work (addresses, partial sums) that can be hoisted out of the loop",
     IssueType.MISSING_AUTOTUNE: (
         "Tile/block sizes are fixed integer #define constants and the GRF register-file size "
@@ -102,10 +108,15 @@ _CM_DESCRIPTIONS: dict[IssueType, str] = {
 }
 
 # CM is lower-level than Triton, so the Triton/CUTLASS-only issue types do not
-# apply. Reuse the SYCL skip set, but KEEP ``missing_autotune``: CM block sizes
-# are compile-time #defines (and GRF is a compiler flag), so the autotuning
-# stage drives a real parameter sweep over them — see CMAutotuneSignature.
-_CM_SKIP_ISSUES: set[IssueType] = set(_SYCL_SKIP_ISSUES) - {IssueType.MISSING_AUTOTUNE}
+# apply. Reuse the SYCL skip set, but KEEP ``missing_autotune`` (CM block sizes
+# are compile-time #defines + GRF is a compiler flag, so autotuning drives a
+# real sweep) and the generic register-blocking / occupancy issues (CM exposes
+# the per-thread tile + GRF directly, so they are actionable).
+_CM_SKIP_ISSUES: set[IssueType] = set(_SYCL_SKIP_ISSUES) - {
+    IssueType.MISSING_AUTOTUNE,
+    IssueType.MISSING_REGISTER_BLOCKING,
+    IssueType.LOW_OCCUPANCY,
+}
 
 
 def _build_issue_categories(dsl: DSL = DSL.TRITON) -> str:
@@ -172,6 +183,8 @@ def _build_issue_categories(dsl: DSL = DSL.TRITON) -> str:
         IssueType.CACHE_EVICTION_RISK: "large tile or long liveness evicts L2 cache lines",
         IssueType.LONG_LIVENESS: "tensor live across many ops — occupancy/register pressure risk",
         IssueType.HIGH_REGISTER_PRESSURE: "too many live values — reduces occupancy",
+        IssueType.MISSING_REGISTER_BLOCKING: "each value loaded from memory feeds too few compute ops — hold a larger per-thread output tile in registers so each load is reused across more MACs (register/output blocking), raising arithmetic intensity. Best tile is hardware-dependent — pair with autotuning",
+        IssueType.LOW_OCCUPANCY: "too few resident threads to hide memory/instruction latency (often oversized tiles or heavy per-thread register/SLM use) — balance per-thread resource use against the number of resident threads; measure both regimes",
         # BLOCK POINTERS
         IssueType.MANUAL_POINTER_ARITHMETIC: "manual offset arithmetic — replace with tl.make_block_ptr",
         IssueType.BLOCK_PTR_BOUNDARY_WRONG: "boundary_check uses booleans instead of dimension indices (0,1)",

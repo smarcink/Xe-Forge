@@ -1176,6 +1176,15 @@ class OptimizerAgent(Optimizer):
         iters_used = 0
         attempt_history: list[str] = []  # what each run tried and achieved
 
+        # De-greedy exploration: don't stop at the FIRST attempt that fails to
+        # beat the best — let the stage spend its remaining iteration budget
+        # trying DIFFERENT approaches (fed the attempt history) up to this many
+        # consecutive misses. A stage often needs a couple of tries to find a
+        # transformation that pays, and at bench-scale measurement the signal is
+        # reliable enough to explore. Bounded by max_iterations either way.
+        _PATIENCE = 2
+        _no_improve = 0
+
         current_code_for_run = code
 
         try:
@@ -1247,6 +1256,7 @@ class OptimizerAgent(Optimizer):
                         f"Stage {stage.value} new best: {spd:.2f}x"
                         + (f" (was {best_spd:.2f}x)" if best_spd is not None else "")
                     )
+                    _no_improve = 0
                     best_code, best_spd, best_mb, best_ma, best_traj = (
                         candidate,
                         spd,
@@ -1286,10 +1296,35 @@ class OptimizerAgent(Optimizer):
                 else:
                     _best_str = f"{best_spd:.2f}x" if best_spd is not None else "none"
                     _spd_str = f"{spd:.2f}x" if spd is not None else "N/A"
+                    _no_improve += 1
+                    # De-greedy: don't bail on the first miss — spend remaining
+                    # budget trying a DIFFERENT approach, unless patience is out
+                    # (or there is no budget left for another run).
+                    if _no_improve >= _PATIENCE or iters_used >= self.max_iterations:
+                        logger.info(
+                            f"Stage {stage.value} no improvement ({_spd_str} vs best "
+                            f"{_best_str}) after {_no_improve} tries — stopping"
+                        )
+                        break
                     logger.info(
-                        f"Stage {stage.value} no improvement ({_spd_str} vs best {_best_str}), stopping"
+                        f"Stage {stage.value} no improvement ({_spd_str} vs best "
+                        f"{_best_str}) — retrying a different approach "
+                        f"({_no_improve}/{_PATIENCE})"
                     )
-                    break
+                    # Feed back what was tried so the next run does something
+                    # structurally different (not a tweak of the same idea).
+                    # Keep current_code_for_run at the best-so-far (or original)
+                    # so we never start from a regression.
+                    history_text = "\n".join(attempt_history[-3:])
+                    _issues_with_history = issues_text + (
+                        f"\n\n=== Previous attempts this stage ===\n{history_text}\n"
+                        "None of these beat the baseline. Try a DIFFERENT approach "
+                        "(a different transformation or structure), not a variation "
+                        "of the above."
+                        if attempt_history
+                        else ""
+                    )
+                    kwargs = {**kwargs, "issues": _issues_with_history}
 
             if best_code is not None:
                 logger.info(

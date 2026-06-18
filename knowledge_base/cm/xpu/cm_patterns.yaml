@@ -79,7 +79,7 @@ patterns:
       // This removes loop control overhead, turns the index into a constant
       // (required for static .select<>()/.row() GRF addressing), keeps the
       // accumulator register-resident, and lets the scheduler interleave loads
-      // with DPAS to hide latency. Unroll tight chunk loops like this:
+      // with the compute to hide latency. Unroll tight chunk loops like this:
       #pragma unroll
       for (int t = 0; t < NUM_TILES; t++)          // NUM_TILES is a compile-time constant
         tile.row(t) = cm_load<uint, TILE_ELEMS>(surf, offset[t]);
@@ -99,16 +99,98 @@ patterns:
       Benefits: removes branch/induction overhead; makes loop indices constant
       so register tiles can be addressed statically with .select<>()/.row()
       (often REQUIRED, not just faster); exposes more instruction-level
-      parallelism so loads and DPAS pipeline together.
+      parallelism so loads and compute (DPAS or plain FMA) pipeline together.
       Consequences: more unrolling means a larger instruction footprint and
       more simultaneously-live values, which raises GRF pressure and can cause
       register spills that collapse performance (see cm_register_file_budget).
       When useful: tight inner loops with small, fixed bounds — e.g. the K/TILE_K
       DPAS loop and tile-chunk loops. Prefer #pragma nounroll or a small
       partial factor for long or runtime-bounded loops.
-    rationale: "Unrolling tight constant-bound loops cuts control overhead, enables static GRF indexing, and pipelines loads with DPAS — but over-unrolling spills the GRF."
+    rationale: "Unrolling tight constant-bound loops cuts control overhead, enables static GRF indexing, and pipelines loads with compute (DPAS or FMA) — but over-unrolling spills the GRF."
     expected_speedup: "1.1-1.5x for tight inner loops (and can be required for static GRF indexing)"
     applies_to: [gemm, conv, reduction, dpas, elementwise]
+
+  - id: cm_register_blocking
+    name: "Register/output blocking — reuse each loaded operand across a per-thread tile"
+    stage: memory_access
+    before: |
+      // Small per-thread output tile: each loaded A/B value feeds very few MACs,
+      // so the kernel streams operands from memory faster than it computes on
+      // them (low arithmetic intensity, memory/latency bound).
+      matrix<half, 1, BLOCK_N> acc = 0;          // 1 row -> each B element used once
+    after: |
+      // Hold a larger BLOCK_M x BLOCK_N output tile in registers for the whole
+      // K-loop. A rank-BLOCK_K update reuses each loaded A element across BLOCK_N
+      // columns and each loaded B element across BLOCK_M rows, so each memory load
+      // feeds ~BLOCK_M*BLOCK_N/(BLOCK_M+BLOCK_N) MACs instead of ~1.
+      matrix<half, BLOCK_M, BLOCK_N> acc = 0;    // register-resident accumulator
+      for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
+        matrix<half, BLOCK_M, BLOCK_K> a;        // load A sub-tile (1D block loads)
+        matrix<half, BLOCK_K, BLOCK_N> b;        // load B sub-tile
+        // ... load a, b ...
+        #pragma unroll
+        for (int kk = 0; kk < BLOCK_K; kk++) {
+          vector<half, BLOCK_N> brow = b.row(kk);
+          #pragma unroll
+          for (int i = 0; i < BLOCK_M; i++)
+            acc.row(i) += a(i, kk) * brow;       // each load reused across the tile
+        }
+      }
+    description: |
+      The foundational GEMM/conv optimization and the FIRST lever to try on a
+      memory/latency-bound matmul — independent of whether the device has DPAS.
+      Each thread keeps a BLOCK_M x BLOCK_N output tile in registers and updates
+      it by a rank-BLOCK_K outer product, so every value loaded from memory is
+      reused across the tile instead of once. This raises arithmetic intensity
+      (FLOP per byte) and keeps the ALUs — or the DPAS array, if present — fed.
+      On hardware WITH DPAS the register tile is what the DPAS instruction
+      operates on; WITHOUT DPAS it directly cuts the load/compute ratio that
+      bounds a naive kernel. The independent accumulator rows also give the
+      scheduler instruction-level parallelism to hide load + MAC latency (often
+      more effective than source-level double-buffering on in-order EUs — measure
+      before adding explicit prefetch).
+      TRADE-OFF: a bigger tile reuses more but uses more registers, which lowers
+      the number of resident threads (occupancy) and risks GRF spills that
+      collapse performance. The best tile is hardware-dependent — size it against
+      the register budget (see cm_register_file_budget) and let autotuning sweep
+      it (see cm_grf_register_file_size and cm_occupancy_balance). Pair larger
+      tiles with large GRF, smaller tiles with the default GRF for occupancy.
+    rationale: "Reusing each loaded operand across a register-resident tile raises arithmetic intensity and feeds the ALUs/DPAS; it is the basis of all fast GEMM, with the tile size traded against occupancy and spills."
+    expected_speedup: "2-5x over a naive per-element kernel (problem- and hardware-dependent; tune the tile)"
+    applies_to: [gemm, matmul, conv, reduction]
+
+  - id: cm_occupancy_balance
+    name: "Balance per-thread resource use against occupancy to hide latency"
+    stage: device_specific
+    before: |
+      // One oversized per-thread tile (large registers / large GRF / large SLM)
+      // -> very few resident hardware threads -> nothing to switch to while a
+      // load or long-latency op is in flight -> the EUs stall (latency-bound).
+    after: |
+      // A GPU hides memory + instruction latency two ways: (1) OCCUPANCY — many
+      // resident threads so the EU switches to a ready thread while others wait;
+      // (2) per-thread instruction-level parallelism (independent accumulators,
+      // unrolling). Tune the balance:
+      //   - Smaller per-thread tile / default GRF (128) -> more resident threads.
+      //   - Larger tile / large GRF (256) -> more per-thread reuse, fewer threads.
+      // The sweet spot is hardware-dependent; sweep both regimes and MEASURE.
+      // A "Spill memory used = N bytes" compiler message means the tile/GRF combo
+      // spilled — shrink the tile or raise GRF; spills usually collapse perf.
+    description: |
+      Occupancy = how many work-items are resident per Xe-core at once; it is a
+      primary latency-hiding mechanism on GPUs. Large per-thread tiles, large GRF
+      mode, and heavy SLM use each REDUCE the number of resident threads. A kernel
+      that is neither bandwidth- nor compute-saturated (sitting well below peak)
+      is usually latency/occupancy bound: too few threads to cover load latency.
+      Rebalance by shrinking the per-thread tile, using the default register file,
+      or cutting SLM — then re-measure. Conversely, if occupancy is already high
+      but each thread does too little work, raise the tile (see
+      cm_register_blocking). There is no universal best point: small-tile / high-
+      occupancy wins on some GPUs, large-tile / high-reuse on others — which is
+      why the autotuner sweeps tile sizes AND GRF and lets measurement decide.
+    rationale: "Most kernels far below roofline are latency-bound; raising occupancy (smaller per-thread footprint) or per-thread ILP hides that latency. The balance is hardware-specific and must be measured."
+    expected_speedup: "1.3-2x when a kernel is occupancy/latency limited"
+    applies_to: [gemm, conv, reduction, elementwise, stencil]
 
   - id: cm_slm_staging
     name: "Stage reused tiles through SLM with the LSC SLM ops"
@@ -146,8 +228,12 @@ patterns:
       them with cmtl::cm_vector_assign from <cm/cmtl.h>).
       THIS ONLY HELPS WITH A THREAD GROUP: it is a no-op (pure overhead) unless a
       cooperative work-group-size knob is > 1 — see cm_cooperative_slm_tiling.
-    rationale: "SLM bandwidth is far higher than HBM; group-level reuse amortizes global loads, but only once the threads actually form a group."
-    expected_speedup: "1.5-3x for memory-bound tiles that are shared across a group"
+      AND EVEN WITH A GROUP, MEASURE: on hardware with a strong L2 cache the
+      cache may already capture this reuse, so SLM staging only wins when the
+      shared reuse exceeds what the cache provides — the cm_slm_fence + cm_barrier
+      sync is not free and can make SLM a net loss. Verify, don't assume.
+    rationale: "SLM bandwidth is higher than HBM, but a strong L2 may already serve the shared tile and the barriers add sync cost — group-level SLM staging only pays when measured reuse exceeds the cache; always verify on the target hardware."
+    expected_speedup: "conditional: up to ~1.5-3x when the cache does NOT already capture the reuse and the group is real; can be a NET LOSS (barrier/sync overhead) when L2 already serves the shared tile — measure"
     applies_to: [gemm, stencil, reduction, conv]
 
   - id: cm_cooperative_slm_tiling
@@ -232,8 +318,16 @@ patterns:
       the work-group-size knobs must stay <= the device max work-group size. See
       cm_slm_staging for the SLM-op signatures and cm_slm_cooperative_correctness
       for the synchronization rules.
-    rationale: "Sharing an input tile across a group through SLM cuts that operand's HBM traffic by the group size — the dominant lever for memory-bound GEMM without DPAS."
-    expected_speedup: "1.5-4x for memory-bound GEMM/conv tiles (scales with the group size, up to SLM/occupancy limits)"
+      MEASURE BEFORE ADOPTING: cooperative SLM only wins when the shared operand's
+      reuse is NOT already captured by the cache hierarchy. On hardware with a
+      strong L2, the L2 transparently serves the shared rows/columns to every
+      thread with no barriers, so SLM staging (which adds cm_slm_fence + cm_barrier
+      per K-step) can be a NET LOSS — register blocking + occupancy may beat it.
+      It pays most on hardware with weak/no L2, or when the working set is large
+      enough to thrash the cache. Treat it as a candidate to benchmark, not a
+      guaranteed win, and compare against the simpler register-blocked kernel.
+    rationale: "Sharing an input tile across a group through SLM can cut that operand's HBM traffic by the group size — but a strong L2 may already provide that reuse for free, so the win is hardware-dependent and must be measured against a register-blocked baseline."
+    expected_speedup: "conditional: up to ~1.5-4x on cache-weak hardware / large working sets; near-zero or a net loss when L2 already serves the shared tile — measure vs a register-blocked kernel"
     applies_to: [gemm, matmul, conv, stencil]
 
   - id: cm_1d_block_load

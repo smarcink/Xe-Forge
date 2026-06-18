@@ -77,6 +77,9 @@ class IssueType(StrEnum):
     CACHE_EVICTION_RISK = "cache_eviction_risk"
     LONG_LIVENESS = "long_liveness"
     HIGH_REGISTER_PRESSURE = "high_register_pressure"
+    # COMPUTE INTENSITY / OCCUPANCY  (generic GPU — hardware-neutral)
+    MISSING_REGISTER_BLOCKING = "missing_register_blocking"
+    LOW_OCCUPANCY = "low_occupancy"
     # BLOCK POINTERS
     BLOCK_PTR_BOUNDARY_WRONG = "block_ptr_boundary_wrong"
     BLOCK_PTR_MULTIPLE_OF_MISUSE = "block_ptr_multiple_of_misuse"
