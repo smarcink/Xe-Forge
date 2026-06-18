@@ -170,8 +170,14 @@ def run(manifest: dict) -> int:
         queue.finish()
         events = [kernel(queue, gsize, lsize, *args) for _ in range(iterations)]
         queue.finish()
-        total_ns = sum(e.profile.end - e.profile.start for e in events)
-        mean_ms = (total_ns / iterations) * 1e-6
+        # The MIN iteration is the
+        # one that hit peak clock with the least interference — the most
+        # reproducible estimate of true kernel cost (this is what clpeak reports).
+        # median + mean are emitted too so the parent can see the spread.
+        per_ms = sorted((e.profile.end - e.profile.start) * 1e-6 for e in events)
+        min_ms = per_ms[0]
+        median_ms = per_ms[len(per_ms) // 2]
+        mean_ms = sum(per_ms) / iterations
     except Exception as e:
         return _fail("run", f"kernel launch failed: {e}")
 
@@ -188,7 +194,15 @@ def run(manifest: dict) -> int:
     except Exception as e:
         return _fail("io", f"output dump failed: {e}")
 
-    _emit({"success": True, "time_ms": mean_ms, "entry": entry})
+    _emit(
+        {
+            "success": True,
+            "time_ms": min_ms,  # headline = MIN (robust to DVFS/interference)
+            "time_median_ms": median_ms,
+            "time_mean_ms": mean_ms,
+            "entry": entry,
+        }
+    )
     return 0
 
 

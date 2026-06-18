@@ -86,7 +86,7 @@ class CMCompiler:
         input_dir: str | None = None,
         output_dir: str | None = None,
         iterations: int = 20,
-        warmup: int = 3,
+        warmup: int = 10,
         entry: str | None = None,
         extra_build_options: list[str] | None = None,
     ) -> CMRunResult:

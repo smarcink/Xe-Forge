@@ -549,7 +549,29 @@ class XeForgePipeline:
 
             if self.executor and (_is_cpp or input_shapes) and current_code != kernel_code:
                 try:
+                    adj_orig_ms = adj_orig_tflops = None
                     if isinstance(_bench_ex, CMExecutor):
+                        # Re-measure the BASELINE adjacent to the final kernel so
+                        # both share the same GPU clock/thermal state, then time
+                        # the optimized kernel immediately after. Measuring the
+                        # baseline once at t=0 and the final at t=END compared two
+                        # different DVFS/boost states (cold-vs-hot) and made the
+                        # end-to-end speedup unreliable; back-to-back fixes that.
+                        try:
+                            base_r = _bench_ex.execute(
+                                kernel_code=kernel_code,
+                                dims=spec_dims,
+                                input_shapes=input_shapes,
+                                input_dtypes=input_dtypes,
+                                output_shapes=output_shapes,
+                                output_dtypes=output_dtypes,
+                                flop=flop,
+                            )
+                            if base_r.success:
+                                adj_orig_ms = base_r.execution_time_ms
+                                adj_orig_tflops = base_r.tflops
+                        except Exception as e:
+                            logger.debug(f"Adjacent baseline re-measure failed: {e}")
                         opt_r = _bench_ex.execute(
                             kernel_code=current_code,
                             dims=spec_dims,
@@ -582,6 +604,13 @@ class XeForgePipeline:
                             opt_r.tflops,
                             opt_r.execution_time_ms,
                         )
+                        # Prefer the adjacent (same-clock-state) baseline for the
+                        # headline speedup; overwrite the reported original so the
+                        # RESULTS "original -> optimized" pair is internally
+                        # consistent. Fall back to the cold t=0 baseline.
+                        if adj_orig_ms:
+                            result.original_ms = adj_orig_ms
+                            result.original_tflops = adj_orig_tflops
                         if result.original_ms and result.optimized_ms:
                             result.total_speedup = result.original_ms / result.optimized_ms
                             logger.info(f"Total speedup: {result.total_speedup:.2f}x")

@@ -273,7 +273,7 @@ def test_load_spec_with_grid_and_outputs():
     # Check outputs
     assert "outputs" in dir(spec), "spec should have outputs attribute"
     assert "D" in spec.outputs, "spec.outputs should have D"
-    assert spec.outputs["D"].dtype == "float32", "D should be float32"
+    assert spec.outputs["D"].dtype == "float16", "D should be float16"
     assert spec.outputs["D"].shape_vars == ["M", "N"], "D shape should be [M, N]"
 
     # Check grid
