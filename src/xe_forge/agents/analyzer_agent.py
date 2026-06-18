@@ -659,13 +659,18 @@ class AnalyzerAgent:
             lines.append(f"TARGET DTYPE: {target_dtype}")
             lines.append(
                 f"Use {target_dtype} for the inputs/outputs the spec declares. "
-                "ACCUMULATOR precision is a SEPARATE choice: a wider accumulator "
-                "(e.g. float32 for half/bfloat16 inputs) is the safe default and "
-                "limits rounding error over long reductions — but if the kernel "
-                "and spec DELIBERATELY use a narrower accumulator (e.g. half) and "
-                "it still meets the spec's correctness tolerance, RESPECT that "
-                "choice and do NOT flag it as a precision bug. The spec's declared "
-                "output dtype, not a fixed convention, decides what is required."
+                "ACCUMULATOR precision is a SEPARATE, author-chosen property and "
+                "is NOT dictated by the I/O dtype. The provided kernel's "
+                "accumulator type is a DELIBERATE choice; runtime correctness "
+                "validation (output compared to the reference under the spec's "
+                "tolerance) — NOT this static review — is what decides whether it "
+                "is acceptable. Therefore raise dtype_precision ONLY for: "
+                "(a) float64 used anywhere (always slow on GPU), or "
+                "(b) an accumulator strictly NARROWER than the declared output "
+                "dtype. Do NOT flag an accumulator that is at least as wide as the "
+                "output dtype (e.g. half accumulate with a half output, or float "
+                "accumulate with any output): a wider accumulator is only a safe "
+                "default you may SUGGEST, never a correctness bug to report."
             )
             lines.append("")
 
