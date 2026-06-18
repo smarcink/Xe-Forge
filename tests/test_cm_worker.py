@@ -119,6 +119,48 @@ def test_run_builds_expected_manifest(tmp_path):
     assert manifest["warmup"] == 3
 
 
+def test_executor_threads_grf_directive_to_build(tmp_path):
+    """A ``// xe-forge-build: -Qxcm_register_file_size=256`` directive in the
+    kernel SOURCE (what the optimizer stamps for high register pressure) flows
+    all the way through ``CMExecutor.execute`` into the compiler build options —
+    so the kernel is compiled with the large register file, not just during
+    autotuning. This exercises the whole chain (parse -> run -> manifest) with a
+    mocked worker subprocess, no GPU.
+    """
+    from xe_forge.core.cm_executor import CMExecutor
+
+    kernel = (
+        "// xe-forge-build: -Qxcm_register_file_size=256\n"
+        "#include <cm/cm.h>\n"
+        "#define BLOCK_M 8\n"
+        "#define BLOCK_N 16\n"
+        "#define BLOCK_K 16\n"
+        'extern "C" _GENX_MAIN_ void\n'
+        "cm_gemm(SurfaceIndex a, SurfaceIndex b, SurfaceIndex d, int M, int N, int K) {}\n"
+    )
+    out_dir = tmp_path / "out"
+    ex = CMExecutor(hang_timeout=5)
+
+    fake = _FakePopen(
+        stdout=RESULT_PREFIX + json.dumps({"success": True, "time_ms": 0.5, "entry": "cm_gemm"})
+    )
+    with mock.patch("xe_forge.core.cm_compiler.subprocess.Popen", return_value=fake):
+        result = ex.execute(
+            kernel_code=kernel,
+            dims={"M": 256, "N": 128, "K": 64},
+            input_shapes=[(256, 64), (64, 128)],
+            input_dtypes=["float16", "float16"],
+            output_shapes=[(256, 128)],
+            output_dtypes=["float16"],
+            output_dir=str(out_dir),
+        )
+
+    assert result.success is True
+    manifest = json.loads((out_dir / "cm_launch.json").read_text())
+    # The base option plus the directive the executor parsed from the source.
+    assert manifest["build_options"] == "-cmc -Qxcm_register_file_size=256"
+
+
 def test_run_timeout_kills_worker(tmp_path):
     """A hung kernel trips the timeout, force-kills the tree, and fails gracefully."""
     src = _src(tmp_path)

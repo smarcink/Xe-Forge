@@ -512,6 +512,23 @@ class CMOptimizationSignature(dspy.Signature):
       with SystolicDepth fixed at 8. bf16/half (CM_PRECISION_BF/HF) -> float
       accumulate; int8 (CM_PRECISION_S8/U8) -> int32 accumulate.
     - Register tiles: vector<T,N> / matrix<T,R,C> sized to the GRF budget
+    - GRF register-file size (build directive): the per-thread register file is a
+      COMPILER flag, not a #define. When a kernel holds large or many live
+      vector<>/matrix<> tiles — big per-thread output tiles, DPAS with a large
+      RepeatCount, or deep unrolling — it can run short of registers and spill
+      (or be forced to a smaller, slower tile). To give it the LARGE register
+      file, put a directive comment at the TOP of the source (valid before
+      #include):
+          // xe-forge-build: -Qxcm_register_file_size=256
+      The harness honors it on every compile. Use it whenever register pressure
+      is high EVEN BEFORE an actual spill (large/numerous live tiles). TRADE-OFF:
+      the large file HALVES the number of resident threads (occupancy), so it
+      pays for large-tile / high-reuse kernels and HURTS small-tile / high-
+      occupancy ones — measurement decides. ``=auto`` lets the compiler pick the
+      large file only when it detects a spill; an explicit ``=256`` forces it
+      (use the forced form when you want the bigger tile BEFORE the compiler
+      would spill). Values are platform-dependent (128 and 256 are valid on
+      current Arc/Xe-LPG/BMG parts).
     - SLM staging (cooperative): reuse a tile shared across a thread group —
       raise a work-group-size knob from grid_contract so neighbouring tiles
       share one group, then cm_slm_init + cm_slm_alloc, move the shared tile with
@@ -536,10 +553,17 @@ class CMOptimizationSignature(dspy.Signature):
     MEMORY_ACCESS: use LSC 1D block loads; when one input tile is re-read by many
       threads, form a cooperative thread group (raise a work-group-size knob from
       grid_contract) and stage that shared tile through SLM so it is fetched from
-      HBM once per group instead of once per thread.
-    DEVICE_SPECIFIC: map matmul/conv inner loops onto DPAS (SystolicDepth=8),
-      widen operands so the compiler emits wider SIMD, and size the per-thread
-      tile to the GRF/EU budget of the target Xe device.
+      HBM once per group instead of once per thread. If a larger per-thread
+      register tile raises register pressure, stamp the
+      // xe-forge-build: -Qxcm_register_file_size=256 directive so the bigger
+      tile fits the register file instead of spilling.
+    DEVICE_SPECIFIC: map matmul/conv inner loops onto DPAS (SystolicDepth=8) IF
+      the device has XMX, widen operands so the compiler emits wider SIMD, and
+      size the per-thread tile to the GRF/EU budget of the target Xe device. When
+      the tile (or DPAS with a large RepeatCount) needs more registers than the
+      default file, stamp // xe-forge-build: -Qxcm_register_file_size=256 to
+      select the large GRF — this is often what makes a big-tile or DPAS kernel
+      pay off (it removes the spill that would otherwise force a smaller tile).
     DISCOVERY: apply the open-ended optimization described in the issues field.
 
     === LAUNCH GRID & BLOCK-SIZE CONTRACT ===

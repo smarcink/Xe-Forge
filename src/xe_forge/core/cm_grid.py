@@ -115,7 +115,9 @@ BUILD_DIRECTIVE_PREFIX = "// xe-forge-build:"
 # Strict allowlist of flags honored from a build directive. The directive feeds
 # ``clBuildProgram`` and the surrounding source may be LLM-generated, so only
 # known-safe flags are accepted — anything else is dropped. Extend deliberately.
-_ALLOWED_BUILD_FLAG_RE = re.compile(r"^-Qxcm_register_file_size=\d+$")
+# The register-file-size value is an integer (e.g. 128, 256) or ``auto`` (let the
+# compiler pick the large file when the kernel needs it).
+_ALLOWED_BUILD_FLAG_RE = re.compile(r"^-Qxcm_register_file_size=(\d+|auto)$")
 
 
 def parse_build_directives(kernel_source: str) -> list[str]:

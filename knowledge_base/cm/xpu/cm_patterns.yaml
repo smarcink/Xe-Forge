@@ -597,8 +597,18 @@ constraints:
       tiles (accumulator + operands + unrolled temporaries), each elements x
       dtype bytes, and keep that total under the budget. A single small tile
       rarely spills; spills come from large register-blocked working sets. If a
-      kernel spills, shrink the tile, split the K-loop, or raise the
-      register-file size (at the cost of occupancy).
+      kernel spills — OR holds a large/numerous live tile set that is close to
+      the budget even before an actual spill — either shrink the tile / split the
+      K-loop to use fewer registers, OR select the LARGE register file by adding
+      a build directive at the TOP of the source (it is a comment, valid before
+      #include; the harness honors it on every compile):
+        // xe-forge-build: -Qxcm_register_file_size=256
+      The large file doubles the per-thread budget but HALVES the resident-thread
+      count (occupancy), so it pays for large-tile / high-reuse kernels and hurts
+      small-tile / high-occupancy ones — measure. ``=auto`` lets the compiler
+      pick the large file only on a detected spill; ``=256`` forces it (use the
+      forced form to grow the tile BEFORE the compiler would spill). Valid values
+      are platform-dependent (128 and 256 on current Arc / Xe-LPG / BMG parts).
     severity: critical
 
   - id: cm_coalesced_contiguous_access

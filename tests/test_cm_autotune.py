@@ -63,6 +63,16 @@ def test_parse_build_directives_allowlist():
     assert toks == ["-Qxcm_register_file_size=256"]  # evil flag dropped
 
 
+def test_parse_build_directives_accepts_auto_rejects_garbage():
+    # "auto" is a valid register-file-size value (compiler picks the large file
+    # on a detected spill); a non-allowlisted value/flag is still dropped.
+    src = (
+        f"{BUILD_DIRECTIVE_PREFIX} -Qxcm_register_file_size=auto "
+        "-Qxcm_register_file_size=evil --rm-rf\n" + BASE
+    )
+    assert parse_build_directives(src) == ["-Qxcm_register_file_size=auto"]
+
+
 def test_stamp_build_directive_roundtrip_and_idempotent():
     stamped = stamp_build_directive(BASE, ["-Qxcm_register_file_size=128"])
     assert parse_build_directives(stamped) == ["-Qxcm_register_file_size=128"]
