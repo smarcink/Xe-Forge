@@ -19,7 +19,7 @@ cm_gemm(SurfaceIndex surfA [[type("buffer_t")]],
   const int tn = cm_global_id(1) * BLOCK_N;
 
   // Accumulate the output tile in float for accuracy.
-  matrix<float, BLOCK_M, BLOCK_N> acc = 0.0f;
+  matrix<half, BLOCK_M, BLOCK_N> acc = 0.0f;
 
   for (int k0 = 0; k0 < K; k0 += BLOCK_K) {
     matrix<half, BLOCK_M, BLOCK_K> a;
@@ -41,5 +41,5 @@ cm_gemm(SurfaceIndex surfA [[type("buffer_t")]],
 
   #pragma unroll
   for (int i = 0; i < BLOCK_M; i++)
-    cm_store<float, BLOCK_N>(surfD, ((tm + i) * N + tn) * sizeof(float), acc.row(i));
+    cm_store<uint32_t, BLOCK_N/2>(surfD, ((tm + i) * N + tn) * sizeof(half), acc.row(i).format<uint32_t>());
 }

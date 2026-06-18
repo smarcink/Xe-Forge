@@ -11,7 +11,7 @@ inputs:
 outputs:
   D:
     shape: [M, N]
-    dtype: float32
+    dtype: float16
 
 grid:
   x: "ceil(M / (BLOCK_M * GROUP_M)) * GROUP_M"
