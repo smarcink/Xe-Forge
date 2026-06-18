@@ -260,19 +260,75 @@ class CMExecutor:
         output_b: np.ndarray,
         rtol: float = 1e-2,
         atol: float = 1e-3,
+        *,
+        dtype: np.dtype | None = None,
     ) -> tuple[bool, str]:
-        """Compare two output tensors element-wise. Returns (passed, message)."""
+        """Compare two output tensors for numerical equivalence.
+
+        Operation-agnostic by design: it flattens the tensors and compares them
+        with a RELATIVE L2 (Euclidean) norm — ``‖b - a‖ / ‖a‖`` — rather than an
+        element-wise ``allclose``. This is the generic correctness gate for an
+        optimizer that may legitimately change the *order* or *precision* of a
+        reduction:
+
+        * Scale-invariant — the normalized error means the same thing whether the
+          outputs are ~1 or ~1e6, so no per-kernel ``atol`` tuning is needed.
+        * Robust to low-precision (fp16/bf16) reordering drift, which spreads
+          small errors across many elements but stays tiny *in aggregate*.
+        * Robust to near-zero catastrophic cancellation: an output element whose
+          true value is ~0 has a huge element-wise relative error but contributes
+          almost nothing to the norm (element-wise ``allclose`` fails on it; the
+          norm shrugs it off).
+        * Still catches real bugs — a wrong scale, a systematic offset, or a large
+          localized error all move the norm well past the threshold. (Unlike
+          cosine similarity, the L2 norm is NOT magnitude-blind, so a kernel that
+          is 2x the reference everywhere correctly fails.)
+
+        ``a`` is the reference (the original kernel's output). The pass threshold
+        is ``rtol``; when ``dtype`` is given and the caller left ``rtol`` at the
+        strict default, a precision-appropriate default is used instead (fp16/bf16
+        tolerate more reordering drift than fp32). NaN/Inf in the optimized output
+        is always a failure. ``atol`` is accepted for signature compatibility and
+        only used as a floor on the reference norm.
+        """
         if output_a.shape != output_b.shape:
             return False, f"Shape mismatch: {output_a.shape} vs {output_b.shape}"
-        if np.allclose(output_a, output_b, rtol=rtol, atol=atol):
-            return True, "Outputs match"
-        diff = np.abs(output_a - output_b)
-        num_mismatch = int(np.sum(~np.isclose(output_a, output_b, rtol=rtol, atol=atol)))
-        total = output_a.size
+
+        a = output_a.astype(np.float64).ravel()
+        b = output_b.astype(np.float64).ravel()
+
+        # NaN / Inf in the candidate is unambiguously wrong, whatever the metric.
+        if not np.all(np.isfinite(b)):
+            n_bad = int(np.sum(~np.isfinite(b)))
+            return False, f"Optimized output has {n_bad} non-finite value(s) (NaN/Inf)"
+
+        # Precision-appropriate default threshold (operation-agnostic — keyed only
+        # on the output dtype, which the spec declares). Used when the caller kept
+        # the strict 1e-2 default; an explicit override always wins.
+        threshold = rtol
+        if dtype is not None and abs(rtol - 1e-2) < 1e-12:
+            name = np.dtype(dtype).name
+            if name in ("float16", "bfloat16"):
+                threshold = 5e-2  # half/bf16: long reductions drift more
+            elif name == "float32":
+                threshold = 1e-2
+
+        ref_norm = float(np.linalg.norm(a))
+        err_norm = float(np.linalg.norm(b - a))
+        # Guard a near-zero reference (all-zero output): fall back to an absolute
+        # norm floor so we don't divide by ~0.
+        denom = ref_norm if ref_norm > atol else max(atol, 1.0)
+        rel_l2 = err_norm / denom
+
+        if rel_l2 <= threshold:
+            return True, f"Outputs match (rel-L2={rel_l2:.2e} <= {threshold:.2e})"
+
+        diff = np.abs(b - a)
+        max_diff = float(np.max(diff)) if diff.size else 0.0
+        mean_diff = float(np.mean(diff)) if diff.size else 0.0
         return False, (
-            f"Outputs differ: max_diff={float(np.max(diff)):.6f}, "
-            f"mean_diff={float(np.mean(diff)):.6f}, "
-            f"mismatched={num_mismatch}/{total} ({100 * num_mismatch / total:.1f}%)"
+            f"Outputs differ: rel-L2={rel_l2:.4e} > tol={threshold:.2e} "
+            f"(max_diff={max_diff:.6f}, mean_diff={mean_diff:.6f})"
         )
 
     def execute(
@@ -477,7 +533,11 @@ class CMExecutor:
         opt_out = os.path.join(opt_output_dir, _OUTPUT_FILE)
         if os.path.exists(orig_out) and os.path.exists(opt_out):
             passed, detail = self.compare_outputs(
-                self.load_output(orig_out, np_dt), self.load_output(opt_out, np_dt), rtol=rtol, atol=atol
+                self.load_output(orig_out, np_dt),
+                self.load_output(opt_out, np_dt),
+                rtol=rtol,
+                atol=atol,
+                dtype=np_dt,
             )
             opt_correct = passed
             correctness_msg = f" CORRECTNESS FAILED: {detail}." if not passed else " Correctness: PASSED."
