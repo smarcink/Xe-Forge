@@ -370,15 +370,126 @@ def _build_pipeline_body(pa: bool, pb: bool) -> str:
     return "".join(s)
 
 
+# ===========================================================================
+# Cooperative SLM staging (a GROUP_M x GROUP_N thread group shares A & B panels)
+# ===========================================================================
+# Both operands are staged at DPAS-atom granularity (A atom = 64 uint32, B atom
+# = 128 uint32 = 2x64) in the exact offline-packed layout, so the operands read
+# back from SLM are byte-identical to the register-blocked kernel -- only their
+# SOURCE changes (SLM instead of a direct global load). The group fetches each
+# shared atom from HBM once instead of once per thread: A traffic is cut by GN,
+# B traffic by GM. API + sync rules per knowledge_base/cm/xpu/cm_patterns.yaml.
+_K_DEFINES_SLM = """#define GM GROUP_M
+#define GN GROUP_N
+#define NT (GM * GN)
+#define A_ATOMS (GM * MB)         /* shared A row-atoms per group, per k-block */
+#define B_ATOMS (GN * NB)         /* shared B col-atoms per group, per k-block */
+#define PTA (A_ATOMS / NT)        /* A atoms each thread cooperatively loads    */
+#define PTB (B_ATOMS / NT)        /* B atoms each thread cooperatively loads    */
+#define A_SLM_BYTES (A_ATOMS * 64 * 4)
+#define B_SLM_BYTES (B_ATOMS * 128 * 4)
+#define SLM_BYTES (A_SLM_BYTES + B_SLM_BYTES)
+"""
+
+_K_BODY_SLM = """
+extern "C" _GENX_MAIN_ void
+cm_gemm(SurfaceIndex surfA [[type("buffer_t")]],
+        SurfaceIndex surfB [[type("buffer_t")]],
+        SurfaceIndex surfD [[type("buffer_t")]],
+        int M, int N, int K) {
+  const int tm = cm_global_id(0) * BLOCK_M;
+  const int tn = cm_global_id(1) * BLOCK_N;
+  const int KBLK = K / DPAS_K;
+
+  // Thread coordinates within the cooperative group.
+  const uint lm  = cm_local_id(0);            // 0..GM-1
+  const uint ln  = cm_local_id(1);            // 0..GN-1
+  const uint tid = lm * GN + ln;              // linear thread id, 0..NT-1
+  const int  gmb = cm_group_id(0) * A_ATOMS;  // group's first global A row-atom
+  const int  gnb = cm_group_id(1) * B_ATOMS;  // group's first global B col-atom
+
+  cm_slm_init(SLM_BYTES);
+  cm_slm_alloc(SLM_BYTES);
+
+  vector<float, RPT * DPAS_N> acc[MB][NB];
+  #pragma unroll
+  for (int mb = 0; mb < MB; mb++)
+    #pragma unroll
+    for (int nb = 0; nb < NB; nb++)
+      acc[mb][nb] = 0.0f;
+
+  for (int kb = 0; kb < KBLK; kb++) {
+    // ---- cooperative load: each thread stages PTA A-atoms + PTB B-atoms ----
+    // A atom = 64 uint32 (one LSC message); SLM slot ai at byte ai*64*4.
+    #pragma unroll
+    for (int i = 0; i < PTA; i++) {
+      const int ai = tid * PTA + i;
+      const int ra = gmb + ai;
+      vector<uint, 64> ca = cm_load<uint32_t, 64>(
+          surfA, ((ra * KBLK + kb) * 64) * sizeof(uint));
+      cm_store_slm<uint, 64>((ai * 64) * sizeof(uint), ca);
+    }
+    // B atom = 128 uint32 -> two 64-uint messages (LSC + SLM ops cap at 64).
+    #pragma unroll
+    for (int j = 0; j < PTB; j++) {
+      const int bj = tid * PTB + j;
+      const int jb = gnb + bj;
+      const int g  = (jb * KBLK + kb) * 128;
+      const unsigned s = A_SLM_BYTES + (bj * 128) * sizeof(uint);
+      cm_store_slm<uint, 64>(s,                     cm_load<uint32_t, 64>(surfB, (g +  0) * sizeof(uint)));
+      cm_store_slm<uint, 64>(s + 64 * sizeof(uint), cm_load<uint32_t, 64>(surfB, (g + 64) * sizeof(uint)));
+    }
+    cm_slm_fence(CM_GLOBAL_COHERENT_FENCE);
+    cm_barrier();
+
+    // ---- read this thread's own operands back from SLM ----
+    vector<uint, RPT*DPAS_K/2> apk[MB];
+    #pragma unroll
+    for (int mb = 0; mb < MB; mb++)
+      apk[mb] = cm_load_slm<uint, 64>(((lm * MB + mb) * 64) * sizeof(uint));
+
+    vector<uint, (DPAS_K/2)*DPAS_N> bpk[NB];
+    #pragma unroll
+    for (int nb = 0; nb < NB; nb++) {
+      const unsigned s = A_SLM_BYTES + ((ln * NB + nb) * 128) * sizeof(uint);
+      bpk[nb].select<64, 1>(0)  = cm_load_slm<uint, 64>(s);
+      bpk[nb].select<64, 1>(64) = cm_load_slm<uint, 64>(s + 64 * sizeof(uint));
+    }
+    cm_barrier();   // WAR: all SLM reads done before the next k-block overwrites it
+
+    #pragma unroll
+    for (int nb = 0; nb < NB; nb++)
+      #pragma unroll
+      for (int mb = 0; mb < MB; mb++)
+        acc[mb][nb] = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, SD, RPT>(
+            acc[mb][nb], bpk[nb], apk[mb]);
+  }
+
+"""
+
+
 def gen_kernel(bm: int, bn: int, *, offline_A: bool, offline_B: bool,
                prefetch: bool = False, prefetch_a: bool | None = None,
-               prefetch_b: bool | None = None, gm: int = 1, gn: int = 1) -> str:
+               prefetch_b: bool | None = None, slm: bool = False,
+               gm: int = 1, gn: int = 1) -> str:
     """Emit a CM GEMM variant for the given tile + offline-pack / pipeline flags.
 
     ``prefetch=True`` is shorthand for prefetching BOTH operands; ``prefetch_a``
     / ``prefetch_b`` override that to pipeline a single operand (the rest load
-    synchronously). Any pipelined variant requires offline-packed A and B.
+    synchronously). ``slm=True`` emits the cooperative-group variant that stages
+    both operands through SLM (requires gm*gn > 1). Any pipelined or SLM variant
+    requires offline-packed A and B.
     """
+    if slm:
+        assert offline_A and offline_B, "SLM variant assumes offline A and B"
+        assert gm * gn > 1, "SLM variant needs a real thread group (gm*gn > 1)"
+        mb, nb = bm // RPT, bn // DPAS_N
+        assert mb % gn == 0, f"GN({gn}) must divide MB({mb}) for even A staging"
+        assert nb % gm == 0, f"GM({gm}) must divide NB({nb}) for even B staging"
+        src = _K_DEFINES + _K_DEFINES_SLM + _K_BODY_SLM + _K_STORE
+        return (src.replace("__BM__", str(bm)).replace("__BN__", str(bn))
+                .replace("__GM__", str(gm)).replace("__GN__", str(gn)))
+
     pa = prefetch if prefetch_a is None else prefetch_a
     pb = prefetch if prefetch_b is None else prefetch_b
     if pa or pb:
@@ -392,6 +503,7 @@ def gen_kernel(bm: int, bn: int, *, offline_A: bool, offline_B: bool,
     src = _K_DEFINES + body + _K_STORE
     return (src.replace("__BM__", str(bm)).replace("__BN__", str(bn))
             .replace("__GM__", str(gm)).replace("__GN__", str(gn)))
+
 
 
 # ===========================================================================
@@ -528,6 +640,45 @@ def build_stages(baseline_src: str) -> list[Stage]:
             gen=lambda: gen_kernel(16, 64, offline_A=True, offline_B=True,
                                    prefetch=True),
             offline_A=True, offline_B=True, regfile=128, ref="04_kprefetch",
+        ),
+        Stage(
+            "11_slm_2x2", "Cooperative SLM 2x2 group (32x64) + 256-GRF",
+            "Lift the GROUP=1 constraint: form a 2x2 thread group (4 threads) "
+            "that cooperatively stages BOTH operands through SLM. Each thread "
+            "still owns a distinct 32x64 output tile, but the group fetches each "
+            "shared A row-atom / B col-atom from HBM ONCE instead of once per "
+            "thread -- A traffic cut 2x (across the 2 N-threads), B traffic cut "
+            "2x (across the 2 M-threads). Adds a per-k-block SLM round-trip + "
+            "fence + 2 barriers. The classic GEMM lever -- but on a strong-L2 "
+            "device the redundant reads were already L2 hits, so this MEASURES "
+            "whether SLM reuse beats the barrier/copy overhead. Compare vs the "
+            "58 TF register-blocked 32x64 (same tile, GROUP=1).",
+            gen=lambda: gen_kernel(32, 64, offline_A=True, offline_B=True,
+                                   slm=True, gm=2, gn=2),
+            offline_A=True, offline_B=True, regfile=256, ref="05_tile32x64",
+        ),
+        Stage(
+            "12_slm_4x4", "Cooperative SLM 4x4 group (32x64) + 256-GRF",
+            "Push the SLM reuse 2x further: a 4x4 group (16 threads) cuts A and "
+            "B HBM traffic 4x each, with a 128x256 group output region and 12 KB "
+            "of SLM. Higher reuse amortises the barrier cost better -- if SLM is "
+            "ever going to win, a bigger group is where. But 16 threads/group at "
+            "256-GRF also pressures occupancy. Brackets 11: if neither 2x2 nor "
+            "4x4 beats the GROUP=1 58 TF, the L2 already serves the reuse and "
+            "SLM is a net loss on this device.",
+            gen=lambda: gen_kernel(32, 64, offline_A=True, offline_B=True,
+                                   slm=True, gm=4, gn=4),
+            offline_A=True, offline_B=True, regfile=256, ref="05_tile32x64",
+        ),
+        Stage(
+            "13_slm_2x2_16x64", "Cooperative SLM 2x2 group (16x64) + 256-GRF",
+            "SLM at a smaller per-thread tile (16x64) so more groups stay "
+            "resident -- tests whether SLM helps once occupancy is higher. "
+            "Compared against the GROUP=1 16x64 pipeline (stage 4, 42 TF) to "
+            "isolate the SLM effect at matched tile.",
+            gen=lambda: gen_kernel(16, 64, offline_A=True, offline_B=True,
+                                   slm=True, gm=2, gn=2),
+            offline_A=True, offline_B=True, regfile=256, ref="04_kprefetch",
         ),
     ]
 
