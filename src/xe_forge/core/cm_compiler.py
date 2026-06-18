@@ -33,9 +33,11 @@ from xe_forge.core.cm_worker import RESULT_PREFIX
 
 logger = logging.getLogger(__name__)
 
-# Default hard timeout (seconds) for a single kernel launch before the worker is
-# considered hung/TDR'd and force-killed. A healthy kernel runs in milliseconds.
-_DEFAULT_HANG_TIMEOUT = 30
+# Default hard timeout (seconds) before the worker is considered hung/TDR'd and
+# force-killed. It bounds the WHOLE worker run (online compile + warmup + all
+# timed iterations), so it must accommodate large problem sizes and high
+# iteration counts — a 4096^3 GEMM at ~100 iterations is seconds, not ms.
+_DEFAULT_HANG_TIMEOUT = 60
 
 
 @dataclass

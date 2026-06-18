@@ -165,7 +165,7 @@ class CMExecutor:
 
     def __init__(
         self,
-        hang_timeout: int = 30,
+        hang_timeout: int = 60,
         iterations: int = 20,
     ):
         self.device_caps = _detect_device_capabilities()
