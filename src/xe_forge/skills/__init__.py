@@ -28,7 +28,9 @@ def main():
     # -- validate --
     p_validate = subparsers.add_parser("validate", help="Static kernel validation")
     p_validate.add_argument("kernel_file", help="Path to kernel file")
-    p_validate.add_argument("--dsl", default="triton", choices=["triton", "sycl", "gluon", "cuda"])
+    p_validate.add_argument(
+        "--dsl", default="triton", choices=["triton", "sycl", "gluon", "cuda", "cm"]
+    )
     p_validate.add_argument("--stage", default=None, help="Current optimization stage")
 
     # -- benchmark --
@@ -39,7 +41,9 @@ def main():
     p_bench.add_argument("--variant", default="bench-gpu", help="Spec variant")
     p_bench.add_argument("--baseline-us", type=float, default=None, help="Cached baseline time")
     p_bench.add_argument("--device", default="xpu", help="Target device")
-    p_bench.add_argument("--dsl", default="triton", choices=["triton", "sycl", "gluon", "cuda"])
+    p_bench.add_argument(
+        "--dsl", default="triton", choices=["triton", "sycl", "gluon", "cuda", "cm"]
+    )
     p_bench.add_argument("--triton-baseline", action="store_true", help="Baseline is Triton kernel")
 
     # -- trial --

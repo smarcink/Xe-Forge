@@ -1,5 +1,5 @@
 # Spec for the naive CM GEMM seed kernel: D = A @ B
-# A: [M, K] fp16, B: [K, N] fp16, D: [M, N] fp32.
+# A: [M, K] fp16, B: [K, N] fp16, D: [M, N] fp16.
 inputs:
   A:
     shape: [M, K]
@@ -30,7 +30,7 @@ ci:
       K: 256
     flop: "2*M*N*K"
 
-bench-A:
+bench-gpu:
   - params: [A, B]
     dims:
       M: 4096

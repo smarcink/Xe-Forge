@@ -6,10 +6,6 @@ toolchain (:class:`xe_forge.core.cm_compiler.CMCompiler`) to compile an original
 and an optimized kernel, run both on identical inputs, and report speedup +
 correctness via :class:`CMComparisonResult` so the optimization loop can consume
 the same feedback shape it gets from SYCL.
-
-The underlying compiler is currently a stub (see ``cm_compiler.py``); until the
-real ``cmc`` + host harness is wired in, compilation fails gracefully with an
-informative message and the optimizer falls back to static checks.
 """
 
 from __future__ import annotations
