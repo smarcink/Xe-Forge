@@ -73,7 +73,7 @@ class CMCompiler:
     def __init__(
         self,
         hang_timeout: int = _DEFAULT_HANG_TIMEOUT,
-        build_options: str = "-cmc",
+        build_options: str = "-cmc -DCM_PTRSIZE=64",
     ):
         self.hang_timeout = hang_timeout
         self.build_options = build_options

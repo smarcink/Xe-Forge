@@ -31,9 +31,11 @@ patterns:
       //                A plain row-major B.format<uint>() is WRONG — B must be VNNI layout.
       //
       // Get the VNNI-packed B one of two ways:
-      // (1) PREFERRED: an LSC 2D block load with VNNI Transform packs it in hardware:
-      //       lsc::block_2d_desc<half,1,/*H*/16,/*W*/16> bd(Bptr, W-1, H-1, P-1, x, y);
-      //       vector<uint,128> bpk;  cm_load<lsc::VNNI>(bpk.format<half>(), bd);
+      // (1) PREFERRED (needs a STATELESS svmptr_t kernel): the untyped 2D block
+      //     load with VNNI Transform packs B in HARDWARE from natural [K,N] --
+      //     see cm_2d_block_load_vnni / cm_stateless_vs_stateful_access. Use the
+      //     function form: cm_ptr_load<half, DPAS_N, DPAS_K, 1, false, /*VNNI*/true>(
+      //         pB, N*2-1, K-1, N*2-1, x, y).format<uint>();
       // (2) MANUAL: interleave consecutive K-row PAIRS into dwords (2 K-elts per dword):
       //       matrix<half, K/2, ExecSize*2> bv;
       //       for (int kp=0; kp<K/2; kp++) {                       // #pragma unroll
@@ -551,6 +553,68 @@ patterns:
     expected_speedup: "1.2-2x; coalescing sub-cache-line transfers can ~halve the load/store message count"
     applies_to: [gemm, matmul, conv, reduction, elementwise, attention, memory_bound]
 
+  - id: cm_2d_block_load_vnni
+    name: "Build DPAS operands with the untyped 2D block load -- hardware VNNI-packs B, no manual shuffle"
+    stage: memory_access
+    before: |
+      // Stateful path: B is hand-packed into the DPAS Src1 VNNI layout in the hot
+      // loop (per-row 1D loads + manual K-pair interleave) -- the dominant
+      // inner-loop cost of a hand-written DPAS GEMM.
+      matrix<half, DPAS_K, DPAS_N> btile;             // per-row 1D loads ...
+      matrix<half, DPAS_K/2, DPAS_N*2> bv;
+      for (int kp = 0; kp < DPAS_K/2; kp++) {          // manual VNNI interleave
+        bv.row(kp).select<DPAS_N,2>(0) = btile.row(2*kp+0);
+        bv.row(kp).select<DPAS_N,2>(1) = btile.row(2*kp+1);
+      }
+      vector<uint, (DPAS_K/2)*DPAS_N> bpk = bv.format<uint>();
+    after: |
+      // Stateless path (the kernel takes svmptr_t pointer args, built with
+      // -DCM_PTRSIZE=64): the untyped 2D block load addresses each tile from a 2D
+      // surface and, for B, applies the VNNI TRANSFORM in HARDWARE, so the DPAS
+      // Src1 operand arrives DPAS-ready from NATURAL [K,N] B. No manual interleave
+      // and no offline pre-pack.
+      half *pA = (half*)A, *pB = (half*)B, *pD = (half*)D;
+      // 2D surface descriptor triple = (Width_bytes-1, Height_elems-1, Pitch_bytes-1).
+      const unsigned aW=(unsigned)(K*2)-1, aH=(unsigned)M-1, aP=(unsigned)(K*2)-1;
+      const unsigned bW=(unsigned)(N*2)-1, bH=(unsigned)K-1, bP=(unsigned)(N*2)-1;
+      // cm_ptr_load<T, BlockWidth, BlockHeight, NBlocks, Transposed, Transformed>(
+      //     ptr, SurfW-1, SurfH-1, SurfPitch-1, BlockX, BlockY)
+      // A: normal load of a BLOCK_M x DPAS_K panel (Transposed=false, Transformed=false)
+      vector<half, BLOCK_M*DPAS_K> ablk =
+          cm_ptr_load<half, DPAS_K, BLOCK_M, 1, false, false>(pA, aW, aH, aP, k0, tm);
+      // B: VNNI-transform load (Transformed=true) -> DPAS-ready Src1 for one N-atom
+      vector<half, DPAS_K*DPAS_N> braw =
+          cm_ptr_load<half, DPAS_N, DPAS_K, 1, false, true>(pB, bW, bH, bP, tn, k0);
+      vector<uint, (DPAS_K/2)*DPAS_N> bpk = braw.format<uint>();
+      acc = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, 8, RPT>(acc, bpk, apk);
+      // store via cm_ptr_store<half, DPAS_N, RPT>(pD, dW, dH, dP, tn, tm, outv);
+    description: |
+      The untyped 2D block load is the in-kernel way to build DPAS operands
+      WITHOUT a manual VNNI shuffle and WITHOUT offline packing: the hardware
+      addresses the tile from a 2D surface and, with the VNNI-TRANSFORM flag,
+      emits B already in the DPAS Src1 (VNNI) byte order. One normal 2D load
+      fetches an A panel; one VNNI 2D load per N-atom fetches a DPAS-ready B atom
+      -- far fewer instructions than per-row 1D loads + interleave. It is
+      STATELESS-ONLY, so it requires svmptr_t kernel args (see
+      cm_stateless_vs_stateful_access); if the kernel currently takes buffer_t
+      surfaces, switch its arguments to svmptr_t to use this load.
+      FUNCTION FORM (use this): cm_ptr_load<T, BlockW, BlockH, NBlocks, Transposed,
+      Transformed>(ptr, SurfW_bytes-1, SurfH_elems-1, SurfPitch_bytes-1, X, Y):
+        - A panel: <half, DPAS_K, BLOCK_M, 1, false, false>  (normal)
+        - B atom : <half, DPAS_N, DPAS_K, 1, false, true>     (VNNI transform)
+      RULES (CM spec): the surface must be LINEAR (non-tiled) / untyped; the VNNI
+      transform supports only 1- and 2-byte element types (fp16/bf16/int8); the
+      pitch must be >= 64 bytes; out-of-bound bytes read as 0. PREFER the function
+      form over the descriptor form (lsc::block_2d_desc + cm_load<lsc::VNNI>): the
+      descriptor-reuse form is faster in theory but has tripped a runtime memory
+      fault (display-TDR risk) on this device -- validate it before relying on it.
+      This removes the dominant manual-pack cost and is the fastest NATURAL-layout
+      (no offline pre-pack) DPAS GEMM path.
+    rationale: "The 2D block load's VNNI transform produces the DPAS Src1 operand in hardware from natural [K,N] B, eliminating the manual K-pair interleave that dominates a hand-packed DPAS GEMM -- available because the kernel uses stateless svmptr_t args."
+    expected_speedup: "~2-3x over a manual in-kernel VNNI-pack GEMM (natural layout, no offline packing)"
+    applies_to: [gemm, matmul, conv, dpas, int8, quantized]
+    requires: [xmx]
+
   - id: cm_dtype_accumulate
     name: "Match DPAS input/accumulator dtypes (float for fp, int32 for int8)"
     stage: dtype_fix
@@ -825,8 +889,41 @@ constraints:
         cm_store<uint32_t, N/2>(surf, byte_off, row.format<uint32_t>());     // store
       (Pack four 8-bit elements per uint32 the same way.) The gather/scatter
       forms (cm_load4 / per-lane offsets) have no such restriction but coalesce
-      worse — prefer the packed block load.
+      worse -- prefer the packed block load.
     severity: critical
+
+  - id: cm_stateless_vs_stateful_access
+    name: "The kernel's pointer-arg type picks the memory model: svmptr_t = stateless, buffer_t = stateful"
+    description: |
+      A CM kernel argument is EITHER a stateful surface or a stateless pointer,
+      and that choice decides which LSC memory API the kernel may use. Match the
+      ops to the arg type -- crossing them does not compile.
+
+      STATELESS -- `svmptr_t A` (a raw 64-bit pointer; needs the build option
+      -DCM_PTRSIZE=64, which this project sets by default). Cast it to a typed
+      pointer (`half *pA = (half*)A;`) and use the STATELESS LSC ops:
+        - 1D block:  cm_ptr_load<T, NElts>(ptr, byte_offset) / cm_ptr_store<...>
+          (same NElts {1,2,3,4,8,16,32,64} and byte-offset rules as cm_load)
+        - 2D block:  the untyped 2D block load/store, INCLUDING the VNNI-transform
+          load that packs a DPAS Src1 operand in HARDWARE -- see
+          cm_2d_block_load_vnni (the fastest natural-layout DPAS GEMM path)
+        - gather/scatter and the descriptor form (lsc::block_2d_desc) also live here.
+      When the kernel's arguments are svmptr_t, the full stateless API -- crucially
+      the 2D HW-VNNI load -- is available; prefer it over a manual in-kernel VNNI
+      shuffle.
+
+      STATEFUL -- `SurfaceIndex surfA [[type("buffer_t")]]` (a binding-table
+      index). Use the STATEFUL ops: cm_load<T, NElts>(surf, byte_offset) /
+      cm_store / cm_load4 gather. The untyped 2D block engine and its VNNI
+      transform are NOT available statefully, so a stateful DPAS GEMM must
+      hand-pack B (manual K-pair interleave) -- the very cost the stateless
+      2D-VNNI load removes.
+
+      ONE ABI, ONE MODEL: never pass a buffer_t to a stateless op or a pointer to
+      a stateful op. To unlock the 2D HW-VNNI load on a buffer_t kernel, switch
+      its args to svmptr_t; both bind to the same host buffer, so correctness is
+      unaffected.
+    severity: info
 
   - id: cm_autotune_register_file_size_values
     name: "-Qxcm_register_file_size only accepts platform-specific values"

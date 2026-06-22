@@ -65,7 +65,7 @@ For each trial:
 {% endif %}5. **Record** — `xe-forge-skill trial result {{ kernel_name }} <trial_id> --correctness <pass|fail> --speedup <float> --baseline-us <float> --triton-us <float>`
 6. **Profile** — {% if vtune_enabled %}if this is trial t1 or later, run `xe-forge-skill profile <candidate{{ ext }}> --spec test_kernels/{{ kernel_name }}.yaml` and use the output to guide the next trial.{% else %}skipped this session (`vtune_enabled: false`); move straight to the next step.{% endif %}
 7. **Decide next action**:
-   - Speedup > 5x -> stop, finalize
+   - Speedup > 15x -> stop, finalize
    - Speedup improved -> continue on this branch
    - Speedup regressed -> branch back to best trial, try different strategy
    - Correctness failed -> fix on same branch
