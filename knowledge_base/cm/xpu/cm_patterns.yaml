@@ -106,9 +106,19 @@ patterns:
         - Only Src1 (B, the VNNI operand) benefits. Pre-blocking Src2 (A, which
           DPAS consumes row-major) gave NO win — A already streams as contiguous
           rows, so spend the effort only on the VNNI operand.
-        - Offline pre-pack also BEAT the in-kernel hardware VNNI 2D-transform load
-          (reading natural B and packing in-flight): pre-packing removes the pack
-          cost entirely instead of paying it on the device every launch.
+        - Offline pre-pack beats the in-kernel hardware VNNI 2D-transform load
+          ONLY while the kernel is still operand-feed bound (e.g. NOT yet L2
+          cache-blocked). Once an L2 tile swizzle (cm_l2_tile_swizzle) makes the
+          operands cache-resident, the bottleneck shifts to load-MESSAGE count and
+          the HW-VNNI 2D load WINS: it fetches a DPAS-ready B atom in ONE message
+          (and up to 2 N-atoms per message with a Width-32 VNNI load -- see
+          cm_2d_block_load_vnni), whereas the offline-packed atom (128 uints)
+          needs TWO 1D loads (the 1D block max is 64 elements). Measured: offline
+          pre-pack helped (~+20%) on an un-swizzled kernel but slightly HURT
+          (~-5%) once swizzled (and the wide HW-VNNI load widens that gap
+          further). So offline packing and L2 swizzling are SUBSTITUTES for the
+          same feed bottleneck -- prefer the swizzle (no host preprocessing, and
+          it keeps the cheaper, fewer-message 2D load).
         - Pack ONCE and reuse across every GEMM that shares the weight — the cost
           amortizes to ~zero over inference.
       APPLICABILITY: this needs a host-side preprocessing step / a layout-
@@ -298,8 +308,65 @@ patterns:
       And do NOT drop to the smaller register file to regain occupancy on a
       pipelined kernel: the pipeline's instruction-level parallelism needs those
       registers, so halving GRF for more resident threads was a large net loss.
+      REGISTER-FREE ALTERNATIVE (prefer when the tile is large): instead of a
+      second operand register set, issue a HARDWARE PREFETCH for the next K-block
+      -- cm_ptr_prefetch<T, Width, Height, NBlocks>(ptr, SurfW-1, SurfH-1,
+      SurfPitch-1, X, Y) (2D) or cm_prefetch / cm_ptr_prefetch (1D) -- which warms
+      L1/L2 with NO register buffer. It hides load latency WITHOUT stealing the
+      accumulator budget, so it can stack on a full-tile kernel where a register
+      double-buffer regressed. Prefetch one K-block ahead and measure.
     rationale: "Prefetching the next K-block into a second named register buffer overlaps LSC load latency with DPAS compute; it pays when latency-bound, saturates when compute-bound, and must use static named buffers to avoid stack spills."
     expected_speedup: "1.1-1.2x on a latency-bound tile; ~0 once compute-bound (and a net loss if it spills)"
+    applies_to: [gemm, matmul, conv, dpas]
+
+  - id: cm_l2_tile_swizzle
+    name: "Remap the tile schedule into operand-sharing super-blocks for L2 reuse"
+    stage: device_specific
+    before: |
+      // Row-major tile mapping: program id (gx,gy) -> output tile
+      // (gx*BLOCK_M, gy*BLOCK_N). Tiles scheduled close in time sweep a whole
+      // output row, so the A rows + B columns they touch form a LARGE working
+      // set that thrashes L2 -- the DPAS array then stalls on HBM-latency loads.
+      const int tm = cm_global_id(0) * BLOCK_M;
+      const int tn = cm_global_id(1) * BLOCK_N;
+    after: |
+      // Group tiles into super-blocks so tiles processed close in time SHARE an
+      // operand panel and stay hot in L2 (the classic GEMM "GROUP_SIZE_M"
+      // swizzle). Linearize the program id, then remap so SWIZZLE_M consecutive
+      // M-tiles for one N-tile run together -> they all reuse the SAME B columns.
+      const int num_pid_m = M / BLOCK_M, num_pid_n = N / BLOCK_N;
+      const int pid = cm_global_id(0) * num_pid_n + cm_global_id(1);
+      const int pid_in_grp = SWIZZLE_M * num_pid_n;
+      const int gid = pid / pid_in_grp;
+      const int first_m = gid * SWIZZLE_M;
+      int gsz = num_pid_m - first_m; if (gsz > SWIZZLE_M) gsz = SWIZZLE_M;
+      const int pid_m = first_m + (pid % gsz);
+      const int pid_n = (pid % pid_in_grp) / gsz;
+      const int tm = pid_m * BLOCK_M, tn = pid_n * BLOCK_N;
+    description: |
+      A compute-bound GEMM sitting far below the DPAS peak is usually NOT
+      DPAS-issue bound but OPERAND-FEED bound: the systolic array idles waiting
+      for A/B loads (e.g. a kernel doing only ~30% of peak is stalling ~70% of
+      the time). Raising the L2 hit rate cuts that load latency and is one of the
+      highest-value levers toward peak -- and it is a PURE SCHEDULING change:
+      remap which output tile each program id computes, with no new loads, no
+      extra registers, and no ABI change. The default row-major tile order makes
+      the tiles in flight sweep a whole output row, so their combined A+B
+      footprint thrashes L2; a super-block (group) swizzle instead keeps a
+      compact set of operand-sharing tiles resident in the cache.
+      HOW: linearize the 2D program id to one pid, then remap it so SWIZZLE_M
+      consecutive M-tiles for each N-tile are processed together (they share that
+      N-tile's B columns); grouping along N instead shares the A rows. Keep the
+      remap a BIJECTION -- every output tile computed exactly once -- and verify
+      correctness.
+      TUNE: sweep the group size SWIZZLE_M (e.g. 4 .. num_pid_m). A bigger group
+      reuses the more-expensive operand more (for a VNNI-packed/transformed B
+      that is the B columns), so a near-column-major schedule (large group) often
+      wins on a strong-L2 part -- measure on the target. This stacks with
+      register blocking, the 2D loads, and prefetch, and costs none of their
+      budget.
+    rationale: "A below-peak compute-bound GEMM is operand-feed bound; reordering the tile schedule into operand-sharing super-blocks raises the L2 hit rate and feeds the DPAS array faster, at zero register/ABI cost."
+    expected_speedup: "1.2-1.5x on a GEMM whose DPAS array is starved by L2/HBM load latency (sweep the group size)"
     applies_to: [gemm, matmul, conv, dpas]
 
   - id: cm_occupancy_balance
@@ -610,6 +677,15 @@ patterns:
       fault (display-TDR risk) on this device -- validate it before relying on it.
       This removes the dominant manual-pack cost and is the fastest NATURAL-layout
       (no offline pre-pack) DPAS GEMM path.
+      FEWER, WIDER MESSAGES: load MULTIPLE DPAS atoms per 2D message and slice them
+      in registers. A 2-byte VNNI transform load allows Width up to 32 elements
+      (Width*sizeof(T) <= 64 B) and NumBlocks 1/2/4, so ONE message can cover 2
+      N-atoms (Width=32) instead of 1 -- .select<>() the per-atom Src1 operands out
+      of the wide result. This matters most once an L2 swizzle
+      (cm_l2_tile_swizzle) has made the operands cache-resident: the bottleneck
+      then becomes LOAD-MESSAGE COUNT, and halving the B-load messages this way was
+      a large measured win (do NOT add a software prefetch on top once the loads
+      are this efficient -- it just pollutes and regresses).
     rationale: "The 2D block load's VNNI transform produces the DPAS Src1 operand in hardware from natural [K,N] B, eliminating the manual K-pair interleave that dominates a hand-packed DPAS GEMM -- available because the kernel uses stateless svmptr_t args."
     expected_speedup: "~2-3x over a manual in-kernel VNNI-pack GEMM (natural layout, no offline packing)"
     applies_to: [gemm, matmul, conv, dpas, int8, quantized]
