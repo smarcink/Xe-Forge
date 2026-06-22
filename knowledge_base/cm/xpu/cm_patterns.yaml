@@ -459,19 +459,15 @@ patterns:
       the work-group-size knobs must stay <= the device max work-group size. See
       cm_slm_staging for the SLM-op signatures and cm_slm_cooperative_correctness
       for the synchronization rules.
-      MEASURE BEFORE ADOPTING: cooperative SLM only wins when the shared operand's
-      reuse is NOT already captured by the cache hierarchy. On hardware with a
-      strong L2, the L2 transparently serves the shared rows/columns to every
-      thread with no barriers, so SLM staging (which adds cm_slm_fence + cm_barrier
-      per K-step) can be a NET LOSS — register blocking + occupancy may beat it.
-      It pays most on hardware with weak/no L2, or when the working set is large
-      enough to thrash the cache. Treat it as a candidate to benchmark, not a
-      guaranteed win, and compare against the simpler register-blocked kernel.
-      MEASURED on a strong-L2 Xe part (Battlemage): cooperative SLM staging was a
-      NET LOSS at every group size tried (2x2 and 4x4, across tile sizes) vs the
-      GROUP=1 register-blocked kernel — the L2 already served the shared panels,
-      so the fence + barriers were pure overhead. Expect a win only where the
-      cache demonstrably cannot capture the reuse.
+      WORTH TRYING, THEN MEASURE: cooperative SLM helps when the shared operand's
+      reuse is NOT already captured by the cache hierarchy. On a part with a strong
+      L2 the cache may already serve the shared rows/columns to every thread, so
+      the extra cm_slm_fence + cm_barrier per K-step may or may not pay off — it
+      tends to win on cache-weak parts or large working sets, and to be roughly
+      neutral where the cache already provides the reuse. Treat it as a real
+      candidate to benchmark against the register-blocked kernel and let the
+      measurement on the target device decide; do not assume either outcome in
+      advance.
     rationale: "Sharing an input tile across a group through SLM can cut that operand's HBM traffic by the group size — but a strong L2 may already provide that reuse for free, so the win is hardware-dependent and must be measured against a register-blocked baseline."
     expected_speedup: "conditional: up to ~1.5-4x on cache-weak hardware / large working sets; near-zero or a net loss when L2 already serves the shared tile — measure vs a register-blocked kernel"
     applies_to: [gemm, matmul, conv, stencil]

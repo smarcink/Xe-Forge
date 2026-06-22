@@ -7,7 +7,7 @@ Follow the CLAUDE.md workflow exactly — every step, in order:
 
 1. Read the baseline kernel file in `test_kernels/` to understand the operations.
 {% if code_language == 'python' %}2. Run `xe-forge-skill analyze test_kernels/<name>{{ ext }}`.
-{% endif %}3. Read relevant knowledge_base/{% if code_language == 'cpp' %}{{ dsl }}/{% endif %} files.
+{% endif %}3. Read relevant knowledge_base/{% if code_language == 'cpp' %}{{ dsl }}/{{ device }}/ and knowledge_base/common/{% endif %} files.
 4. Initialize: `xe-forge-skill trial init <kernel_name> test_kernels/<name>{{ ext }}`
 5. Run ALL max_trials trials (from config.yaml). For EACH trial you MUST:
    - Validate with `xe-forge-skill validate <file> --dsl {{ dsl }}`

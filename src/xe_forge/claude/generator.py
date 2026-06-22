@@ -82,6 +82,7 @@ def generate_workspace(
         _render(
             "optimize-kernel.md.j2",
             dsl=dsl,
+            device=device,
             ext=ext,
             code_language=code_language,
             vtune_enabled=vtune_enabled,
