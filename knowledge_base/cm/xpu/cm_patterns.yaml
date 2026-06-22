@@ -14,29 +14,65 @@ patterns:
       for (int k = 0; k < K; ++k)
         acc += a_row[k] * b_col[k];
     after: |
-      // Map the K inner product onto cm_dpas. SystolicDepth must be 8; the K
-      // dimension is SystolicDepth * OpsPerChannel (8*2=16 for bf16/half,
-      // 8*4=32 for int8). Operands are packed into uint/int GRF registers.
-      // cm_dpas<Src1Prec, Src2Prec, SystolicDepth, RepeatCount, ResTy>(Acc, Src1=B, Src2=A)
-
-      // bf16/half inputs -> float accumulate:
-      matrix<float, RepeatCount, 16> acc = 0;
-      acc = cm_dpas<CM_PRECISION_BF, CM_PRECISION_BF, 8, RepeatCount>(
-                acc, B.format<uint>(), A.format<uint>());
-
-      // int8 inputs -> int32 accumulate (S8 weights x U8 activations):
-      matrix<int, RepeatCount, 16> iacc = 0;
-      iacc = cm_dpas<CM_PRECISION_S8, CM_PRECISION_U8, 8, RepeatCount>(
-                iacc, weights.format<uint>(), input.format<uint>());
+      // cm_dpas CONTRACT (CM spec 4.20) — get this exact or it won't compile / is wrong:
+      //   cm_dpas<Src1Prec, Src2Prec, SystolicDepth=8, RepeatCount>(Acc, Src1=B, Src2=A)
+      //   ORDER is (Acc, B, A): B (Src1) comes BEFORE A (Src2).
+      //   SystolicDepth is ALWAYS 8. RepeatCount = 1..8 = M rows of A per atom.
+      //   ExecSize = N = DPAS output columns = 16 for a float result.
+      //   fp16/bf16: OpsPerChannel=2 -> K per atom = 8*2 = 16, accumulate in FLOAT.
+      //   int8     : OpsPerChannel=4 -> K per atom = 8*4 = 32, accumulate in INT (int32).
+      //   Acc/result : a FLAT vector (NOT a matrix<>), RepeatCount*ExecSize elems, dtype by inputs:
+      //                fp inputs  (half/bf16/tf32/bf8/hf8) -> vector<float, ...>
+      //                int inputs (int2/int4/int8)         -> vector<int,   ...>   (int32)
+      //   Src2 = A   : row-major,   reinterpreted to int/uint -> vector<uint, RepeatCount*8>.
+      //   Src1 = B   : VNNI-PACKED, reinterpreted to int/uint -> vector<uint, 128> (ExecSize=16).
+      //                (uint COUNTS above are identical for fp16 AND int8 — same §4.20 size
+      //                 formula: SD*bits*ops = 8*16*2 = 8*8*4 = 256, /32 = 8.)
+      //                A plain row-major B.format<uint>() is WRONG — B must be VNNI layout.
+      //
+      // Get the VNNI-packed B one of two ways:
+      // (1) PREFERRED: an LSC 2D block load with VNNI Transform packs it in hardware:
+      //       lsc::block_2d_desc<half,1,/*H*/16,/*W*/16> bd(Bptr, W-1, H-1, P-1, x, y);
+      //       vector<uint,128> bpk;  cm_load<lsc::VNNI>(bpk.format<half>(), bd);
+      // (2) MANUAL: interleave consecutive K-row PAIRS into dwords (2 K-elts per dword):
+      //       matrix<half, K/2, ExecSize*2> bv;
+      //       for (int kp=0; kp<K/2; kp++) {                       // #pragma unroll
+      //         bv.row(kp).select<ExecSize,2>(0) = b.row(2*kp+0);  // even K -> dword low
+      //         bv.row(kp).select<ExecSize,2>(1) = b.row(2*kp+1);  // odd  K -> dword high
+      //       }
+      //       vector<uint,(K/2)*ExecSize> bpk = bv.format<uint>();
+      //
+      // One fp16 -> float atom (a: matrix<half, RepeatCount, 16> row-major, B VNNI-packed):
+      vector<float, RepeatCount*16> acc = 0.0f;
+      vector<uint, RepeatCount*8> apk = a.format<uint>();
+      acc = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, 8, RepeatCount>(acc, bpk, apk);
+      // Same shape for int8 -> int32 (K per atom = 32, INT accumulator, uint-packed operands):
+      //   vector<int, RepeatCount*16> iacc = 0;
+      //   iacc = cm_dpas<CM_PRECISION_S8, CM_PRECISION_U8, 8, RepeatCount>(iacc, bpk, apk);
+      // NOTE: a SINGLE narrow atom usually LOSES to FMA — go wide (cm_register_blocking).
     description: |
       The Xe DPAS/XMX (Dot Product Accumulate Systolic) array delivers the bulk
-      of matmul throughput. Express the K-loop inner product as cm_dpas. It
-      supports bf16/half (-> float accumulate) and int8 S8/U8 (-> int32
-      accumulate), plus tf32, bf8/hf8 and int2/int4 on capable hardware (each
-      guarded by a CM_HAS_DPAS* macro). SystolicDepth is fixed at 8; RepeatCount
-      (1..8) sets the number of A rows processed per instruction.
-    rationale: "DPAS provides far higher MAC throughput than scalar/vector FMA on the EU, for both float and integer matmul."
-    expected_speedup: "3-10x for GEMM-like inner loops"
+      of matmul throughput; express the K-loop inner product as cm_dpas. Two
+      things make DPAS code fail to compile or run slow (CM spec 4.20):
+        1. OPERANDS ARE FLAT uint/int VECTORS (not matrices), order (Acc, B, A):
+           Src1=B is VNNI-packed, Src2=A is row-major, both reinterpreted to
+           uint/int; Acc/result is a flat vector<float|int, M*N> (M=RepeatCount,
+           N=16) — FLOAT for fp inputs, INT (int32) for int8/int4/int2. A plain
+           row-major B.format<uint>() is WRONG — Src1 must be VNNI layout
+           (use the lsc::VNNI 2D load, or interleave K-row pairs into dwords).
+        2. A SINGLE narrow atom (one accumulator) does NOT beat the FMA path —
+           the VNNI pack + narrow loads dominate. To win, go WIDE: an MBxNB grid
+           of RepeatCount=8 accumulators fed by block loads (cm_register_blocking).
+           Load each operand ROW with ONE wide block load spanning the FULL tile
+           width and .select<>() the per-N-block operand out of it — do NOT issue
+           a separate narrow load per N-block: that under-uses each LSC message
+           and multiplies the message count for the same bytes (see
+           cm_wide_block_access / cm_1d_block_load).
+      DPAS supports bf16/half (-> float acc) and int8 S8/U8 (-> int32 acc), plus
+      tf32/bf8/hf8/int2/int4 on capable hardware (each guarded by a CM_HAS_DPAS*
+      macro). SystolicDepth is fixed at 8; RepeatCount (1..8) = A rows per atom.
+    rationale: "DPAS far out-throughputs scalar/vector FMA, but only when B is correctly VNNI-packed (spec 4.20) and the tile is wide enough to amortize the pack and keep the systolic array fed."
+    expected_speedup: "3-10x for GEMM once B is VNNI-packed and the tile is wide"
     applies_to: [gemm, matmul, conv, dpas, int8, quantized]
     requires: [xmx]  # needs the XMX/DPAS systolic array (absent on Xe-LPG / MTL / ARL)
 
@@ -337,7 +373,7 @@ patterns:
       // Scattered / gather reads (per-lane offsets or cm_load4) — poor coalescing.
       vector<uint, N> v = cm_load4<uint, ...>(surf, offsets);
     after: |
-      // LSC 1D block load (stateful, by byte offset; NElts in {1,2,4,8,16,32,64}):
+      // LSC 1D block load (stateful, by byte offset; NElts in {1,2,3,4,8,16,32,64}):
       vector<uint, NElts> v =
           cm_load<uint, NElts, DataSize::Default, CacheHint::Cached, CacheHint::Cached>(surf, byte_offset);
 
@@ -355,9 +391,59 @@ patterns:
       half/bfloat16 pack two elements per uint32 and reinterpret —
       cm_load<uint32_t, NElts/2>(surf, byte_off).format<half>() — see the
       cm_block_load_requires_32bit constraint.
+      LOAD WIDE, SLICE: read each row's FULL contiguous width in ONE block load
+      and .select<>() sub-blocks out of it; do NOT split a contiguous row into
+      several narrow per-block loads (it under-uses each LSC message). See
+      cm_wide_block_access for the allowed transfer sizes and the rationale.
     rationale: "Coalesced LSC 1D block reads maximize cache-line utilization and HBM efficiency."
     expected_speedup: "1.3-2x"
     applies_to: [gemm, conv, memory_bound]
+
+  - id: cm_wide_block_access
+    name: "Coalesce into the widest LSC block load/store; slice sub-blocks in registers"
+    stage: memory_access
+    before: |
+      // A contiguous span fetched as several NARROW block loads (one per
+      // sub-block) — more LSC messages than necessary, each under-filling a
+      // cache line, for exactly the same bytes.
+      vector<uint, 8> lo = cm_load<uint, 8>(surf, (row * N + col)      * sizeof(half));
+      vector<uint, 8> hi = cm_load<uint, 8>(surf, (row * N + col + 16) * sizeof(half));
+    after: |
+      // One WIDE block load over the whole contiguous span, then .select<>()
+      // the sub-blocks straight from the register tile (no extra memory traffic):
+      vector<uint, 16> wide = cm_load<uint, 16>(surf, (row * N + col) * sizeof(half));
+      auto lo = wide.select<8, 1>(0);     // first  sub-block (cols col..col+15 as half)
+      auto hi = wide.select<8, 1>(8);     // second sub-block (cols col+16..col+31)
+      // Same rule for output: write the widest contiguous block once with cm_store.
+    description: |
+      An LSC 1D block transfer (cm_load / cm_store / cm_prefetch, addressed by a
+      scalar BYTE offset) moves NElts elements in ONE message. Fewer, WIDER
+      messages win: each message has a fixed issue cost and the hardware moves
+      data in 64-byte cache lines, so a transfer narrower than a cache line
+      wastes the rest of the line, and a contiguous region split into K narrow
+      loads issues K messages for data one wide message could carry. ALWAYS
+      coalesce a contiguous span into the single WIDEST block transfer the size
+      rules allow, then carve sub-blocks out of the register tile with
+      .select<>() / .row() instead of re-loading them. Splitting a contiguous row
+      into a narrow load per sub-block is a common, silent throughput loss (it
+      can roughly halve a compute-bound kernel by multiplying the message count).
+      ALLOWED SIZES (CM spec, validated): NElts must be one of
+      1, 2, 3, 4, 8, 16, 32, 64 — any other count is a COMPILE error. The block
+      form needs a 32-/64-bit element type: with DataSize::Default the element
+      type is T; an explicit DataSize override may only be U32 or U64; the byte
+      offset must be DataSize-aligned.
+      PACK SUB-32-BIT DATA INTO uint (this is why we load as uint, not half): a
+      uint32 element carries TWO halfs/bf16 or FOUR int8, so one
+      cm_load<uint, NElts> moves NElts*4 bytes = 2*NElts halfs = 4*NElts int8
+      (reinterpret the register tile with .format<half>() / .format<>() — see
+      cm_block_load_requires_32bit). The widest single block is NElts=64 = 256 B
+      as uint32 (128 halfs / 256 int8), or 512 B as uint64. Aim to fill at least
+      one 64-byte cache line per transfer, i.e. >= 16 uint32 (32 halfs); for a
+      span wider than 64 elements use several 64-wide blocks, not many
+      sub-cache-line ones.
+    rationale: "One wide LSC block transfer issues fewer messages and fills whole cache lines; splitting a contiguous span into narrow sub-block loads multiplies the message count and wastes cache-line bandwidth for the same bytes."
+    expected_speedup: "1.2-2x; coalescing sub-cache-line transfers can ~halve the load/store message count"
+    applies_to: [gemm, matmul, conv, reduction, elementwise, attention, memory_bound]
 
   - id: cm_dtype_accumulate
     name: "Match DPAS input/accumulator dtypes (float for fp, int32 for int8)"

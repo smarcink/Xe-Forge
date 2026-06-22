@@ -8,7 +8,7 @@ def run(args):
 
     from xe_forge.core.validator import KernelValidator, format_issues
 
-    code = Path(args.kernel_file).read_text()
+    code = Path(args.kernel_file).read_text(encoding="utf-8")
     validator = KernelValidator()
     issues = validator.validate(code, dsl=args.dsl, stage=args.stage)
     print(format_issues(issues))

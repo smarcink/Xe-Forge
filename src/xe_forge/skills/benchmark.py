@@ -11,8 +11,8 @@ def run(args):
     from xe_forge.core.executor import KernelBenchExecutor
     from xe_forge.core.spec_loader import load_spec
 
-    baseline_code = Path(args.baseline).read_text()
-    optimized_code = Path(args.optimized).read_text()
+    baseline_code = Path(args.baseline).read_text(encoding="utf-8")
+    optimized_code = Path(args.optimized).read_text(encoding="utf-8")
 
     spec = load_spec(args.spec)
     variant = spec.resolve_variant(args.variant)
@@ -82,8 +82,8 @@ def _run_cm(args):
     from xe_forge.core.cm_executor import CMExecutor
     from xe_forge.core.spec_loader import load_spec
 
-    baseline_code = Path(args.baseline).read_text()
-    optimized_code = Path(args.optimized).read_text()
+    baseline_code = Path(args.baseline).read_text(encoding="utf-8")
+    optimized_code = Path(args.optimized).read_text(encoding="utf-8")
 
     spec = load_spec(args.spec)
     variant = spec.resolve_variant(args.variant)

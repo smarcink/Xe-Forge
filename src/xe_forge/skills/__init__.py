@@ -12,9 +12,18 @@ Usage:
 """
 
 import argparse
+import sys
 
 
 def main():
+    # Force UTF-8 stdout/stderr so unicode tool output (e.g. the `trial status`
+    # tree's box-drawing characters) doesn't crash on a Windows cp1252 console.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError):
+            pass
+
     parser = argparse.ArgumentParser(
         prog="xe-forge-skill",
         description="Xe-Forge skill tools (used by Claude Code and standalone)",
