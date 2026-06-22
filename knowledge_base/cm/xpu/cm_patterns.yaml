@@ -76,6 +76,51 @@ patterns:
     applies_to: [gemm, matmul, conv, dpas, int8, quantized]
     requires: [xmx]  # needs the XMX/DPAS systolic array (absent on Xe-LPG / MTL / ARL)
 
+  - id: cm_operand_prepack
+    name: "Pre-pack the static DPAS weight (Src1/B) into VNNI layout offline, not in the hot loop"
+    stage: memory_access
+    before: |
+      // The kernel re-shuffles B into the DPAS Src1 (VNNI) byte layout every
+      // k-step — a per-iteration interleave that dominates the inner loop of an
+      // otherwise DPAS-bound GEMM.
+      for (int kp = 0; kp < DPAS_K/2; ++kp) {
+        bv.row(kp).select<16,2>(0) = b.row(2*kp+0);   // manual VNNI pack, hot loop
+        bv.row(kp).select<16,2>(1) = b.row(2*kp+1);
+      }
+    after: |
+      // Pre-pack the STATIC operand (weights = B = DPAS Src1) ONCE on the host
+      // into the exact Src1 VNNI byte layout, then the kernel just loads each
+      // atom as one contiguous block — the in-loop shuffle is gone entirely:
+      vector<uint,128> bpk = cm_load<uint,128>(surfB_packed, atom_byte_off);
+      acc = cm_dpas<CM_PRECISION_HF, CM_PRECISION_HF, 8, RPT>(acc, bpk, apk);
+    description: |
+      The manual per-k-step shuffle that
+      builds the DPAS Src1 operand is the dominant cost of a hand-packed DPAS
+      GEMM, so move it OFF the device — transform the static weight tensor into
+      the exact Src1 VNNI byte layout once on the host, store it that way, and
+      have the kernel issue one contiguous cm_load per atom (bytes identical to
+      what the shuffle produced, so the result is bit-for-bit the same).
+      THREE findings:
+        - Only Src1 (B, the VNNI operand) benefits. Pre-blocking Src2 (A, which
+          DPAS consumes row-major) gave NO win — A already streams as contiguous
+          rows, so spend the effort only on the VNNI operand.
+        - Offline pre-pack also BEAT the in-kernel hardware VNNI 2D-transform load
+          (reading natural B and packing in-flight): pre-packing removes the pack
+          cost entirely instead of paying it on the device every launch.
+        - Pack ONCE and reuse across every GEMM that shares the weight — the cost
+          amortizes to ~zero over inference.
+      APPLICABILITY: this needs a host-side preprocessing step / a layout-
+      transformed weight input (a "pre-packed weights" variant of the op). It fits
+      STATIC weights (Linear / conv / FFN / quantized int8), NOT operands produced
+      on-device earlier in the same graph. When you CANNOT pre-pack (both operands
+      are dynamic, or the harness forbids transforming inputs), the in-kernel
+      equivalent is the hardware VNNI 2D block load (cm_load<lsc::VNNI>, see
+      cm_dpas_matmul) which at least moves the pack into the load hardware.
+    rationale: "Building the DPAS Src1 VNNI operand dominates a hand-packed GEMM's inner loop; pre-packing the static weight off-device turns it into a single contiguous load, and only the VNNI operand (not the row-major one) needs it."
+    expected_speedup: "up to ~2x for a GEMM whose inner loop is dominated by the in-kernel VNNI pack (requires offline weight packing)"
+    applies_to: [gemm, matmul, conv, dpas, int8, quantized, ffn]
+    requires: [xmx]
+
   - id: cm_simd_width
     name: "Widen vectors/matrices to let the compiler emit wider SIMD"
     stage: device_specific
@@ -191,9 +236,69 @@ patterns:
       the register budget (see cm_register_file_budget) and let autotuning sweep
       it (see cm_grf_register_file_size and cm_occupancy_balance). Pair larger
       tiles with large GRF, smaller tiles with the default GRF for occupancy.
+      THE SWEET SPOT IS A CLIFF, NOT A SLOPE: reuse keeps improving as the tile
+      grows (MB*NB/(MB+NB)), but the moment the live accumulator+operand set
+      exceeds the register file the kernel SPILLS and throughput collapses
+      (measured roughly -80% going from a square-ish best tile to ~2x its DPAS-
+      atom count). So sweep the tile and STOP at the LARGEST one that does not
+      spill; the best tile is usually SQUARE-ISH (reuse ~2.0, e.g. ~16 DPAS
+      atoms), NOT the widest or tallest — past the atom ceiling more reuse never
+      pays back the spill.
     rationale: "Reusing each loaded operand across a register-resident tile raises arithmetic intensity and feeds the ALUs/DPAS; it is the basis of all fast GEMM, with the tile size traded against occupancy and spills."
     expected_speedup: "2-5x over a naive per-element kernel (problem- and hardware-dependent; tune the tile)"
     applies_to: [gemm, matmul, conv, reduction]
+
+  - id: cm_k_loop_pipeline
+    name: "Software-pipeline the K loop: prefetch the next K-block into named double buffers"
+    stage: device_specific
+    before: |
+      // Synchronous K loop: each k-block LOADS its operands, then computes on
+      // them. The DPAS array stalls waiting for the loads of the NEXT block
+      // because nothing overlaps the load latency with compute.
+      for (int kb = 0; kb < KBLK; ++kb) {
+        load_A(kb); load_B(kb);          // LSC loads ...
+        dpas_accumulate(kb);             // ... then DPAS waits on them
+      }
+    after: |
+      // Double-buffer: keep TWO explicitly-NAMED operand register sets and issue
+      // the load for k-block (kb+1) BEFORE computing on kb, so the LSC loads run
+      // under the DPAS compute (latency hidden). Unroll K by 2 (even -> set0,
+      // odd -> set1) and prefetch one block ahead.
+      load_A0(0); load_B0(0);                          // preload block 0 into set 0
+      for (int kb = 0; kb < KBLK; ++kb) {
+        if (kb + 1 < KBLK) { load_A1(kb+1); load_B1(kb+1); }  // prefetch next -> other set
+        dpas_accumulate(/* current set for kb */);     // compute while the next loads run
+        // the unroll-by-2 names the two sets statically and swaps their roles
+      }
+      // CRITICAL: the two buffers must be DISTINCT NAMED variables (b0/b1), NOT a
+      // runtime-indexed register array buf[cur] — an indexed register array forces
+      // dynamic GRF addressing, spills the operands to stack, and ends up slower
+      // than the un-pipelined kernel (see cm_loop_unroll: indices must be const).
+    description: |
+      Overlap the next K-block's LSC loads with the current block's DPAS compute
+      by software-pipelining (double-buffering) the K loop. Hold two NAMED
+      operand register sets, preload block 0, then inside the loop prefetch block
+      kb+1 into the idle set before issuing the DPAS on block kb. This hides load
+      latency behind compute and is the main lever once a kernel is LATENCY-bound
+      (not yet saturating the DPAS array) — most effective on small/medium tiles.
+      THREE measured caveats:
+        - NAMED buffers, never an indexed register array. b0/b1 as separate
+          variables stay in registers; buf[cur] with a runtime cur spills to
+          stack and is far slower than the un-pipelined kernel.
+        - DIMINISHING once compute-bound: on a large square tile that already
+          saturates the DPAS array, full double-buffering adds ~0% AND its extra
+          operand buffers can overflow the register file. Pipeline the smaller /
+          latency-bound tile; do not stack it on the biggest tile.
+        - SINGLE-SIDED when GRF is tight: if a full double-buffer overflows the
+          file, prefetch ONLY the latency-dominant operand (in GEMM that is B /
+          Src1 — more load messages and bytes per k-step) for most of the win at
+          half the extra register cost.
+      And do NOT drop to the smaller register file to regain occupancy on a
+      pipelined kernel: the pipeline's instruction-level parallelism needs those
+      registers, so halving GRF for more resident threads was a large net loss.
+    rationale: "Prefetching the next K-block into a second named register buffer overlaps LSC load latency with DPAS compute; it pays when latency-bound, saturates when compute-bound, and must use static named buffers to avoid stack spills."
+    expected_speedup: "1.1-1.2x on a latency-bound tile; ~0 once compute-bound (and a net loss if it spills)"
+    applies_to: [gemm, matmul, conv, dpas]
 
   - id: cm_occupancy_balance
     name: "Balance per-thread resource use against occupancy to hide latency"
@@ -362,6 +467,11 @@ patterns:
       It pays most on hardware with weak/no L2, or when the working set is large
       enough to thrash the cache. Treat it as a candidate to benchmark, not a
       guaranteed win, and compare against the simpler register-blocked kernel.
+      MEASURED on a strong-L2 Xe part (Battlemage): cooperative SLM staging was a
+      NET LOSS at every group size tried (2x2 and 4x4, across tile sizes) vs the
+      GROUP=1 register-blocked kernel — the L2 already served the shared panels,
+      so the fence + barriers were pure overhead. Expect a win only where the
+      cache demonstrably cannot capture the reuse.
     rationale: "Sharing an input tile across a group through SLM can cut that operand's HBM traffic by the group size — but a strong L2 may already provide that reuse for free, so the win is hardware-dependent and must be measured against a register-blocked baseline."
     expected_speedup: "conditional: up to ~1.5-4x on cache-weak hardware / large working sets; near-zero or a net loss when L2 already serves the shared tile — measure vs a register-blocked kernel"
     applies_to: [gemm, matmul, conv, stencil]
