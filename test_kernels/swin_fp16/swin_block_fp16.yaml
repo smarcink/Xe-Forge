@@ -1,0 +1,74 @@
+inputs:
+  X:
+    shape: [B, H, W, C]
+    dtype: float16
+  norm1_weight:
+    shape: [C]
+    dtype: float16
+  norm1_bias:
+    shape: [C]
+    dtype: float16
+  qkv_weight:
+    shape: [QKVO, C]      # nn.Linear(C, 3C).weight -> [3C, C]
+    dtype: float16
+  qkv_bias:
+    shape: [QKVO]
+    dtype: float16
+  proj_weight:
+    shape: [C, C]         # nn.Linear(C, C).weight
+    dtype: float16
+  proj_bias:
+    shape: [C]
+    dtype: float16
+  norm2_weight:
+    shape: [C]
+    dtype: float16
+  norm2_bias:
+    shape: [C]
+    dtype: float16
+  fc1_weight:
+    shape: [HID, C]       # nn.Linear(C, 4C).weight
+    dtype: float16
+  fc1_bias:
+    shape: [HID]
+    dtype: float16
+  fc2_weight:
+    shape: [C, HID]       # nn.Linear(4C, C).weight
+    dtype: float16
+  fc2_bias:
+    shape: [C]
+    dtype: float16
+  rpe_bias:
+    shape: [N, N]         # relative-position bias (single head), N = WIN*WIN = 16
+    dtype: float16
+
+outputs:
+  Y:
+    shape: [B, H, W, C]
+    dtype: float16
+
+# One work-item per 4x4 window. WIN comes from the kernel's #define WIN 4.
+grid:
+  x: "B * (H // WIN)"     # window rows, flattened across the batch
+  y: "W // WIN"           # window columns
+  z: 1
+  local:
+    x: 1
+    y: 1
+    z: 1
+
+# Small correctness shape (fast). H, W divisible by WIN=4.
+ci:
+  - params: [X, norm1_weight, norm1_bias, qkv_weight, qkv_bias, proj_weight,
+             proj_bias, norm2_weight, norm2_bias, fc1_weight, fc1_bias,
+             fc2_weight, fc2_bias, rpe_bias]
+    dims: {B: 1, H: 16, W: 16, C: 32, QKVO: 96, HID: 128, N: 16}
+    flop: "B*H*W*(2*QKVO*C + 4*N*C + 2*C*C + 4*HID*C)"
+
+# Full simplified-Swin workload from get_inputs(): x = randn(1, 720, 1280, 32).
+bench-gpu:
+  - params: [X, norm1_weight, norm1_bias, qkv_weight, qkv_bias, proj_weight,
+             proj_bias, norm2_weight, norm2_bias, fc1_weight, fc1_bias,
+             fc2_weight, fc2_bias, rpe_bias]
+    dims: {B: 1, H: 720, W: 1280, C: 32, QKVO: 96, HID: 128, N: 16}
+    flop: "B*H*W*(2*QKVO*C + 4*N*C + 2*C*C + 4*HID*C)"
