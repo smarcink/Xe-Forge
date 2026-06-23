@@ -808,20 +808,23 @@ patterns:
       //   acc : matrix<float, 32, 64> = 32*64*4 = 8192 B
       //   a   : matrix<half,  32, 32> = 32*32*2 = 2048 B
       //   b   : matrix<half,  32, 64> = 32*64*2 = 4096 B
-      // working set ~14 KB, which exceeds the ~4-8 KB default register budget
-      // (see the cm_register_file_budget constraint), so this spills.
+      // working set ~14 KB, which exceeds the 8 KB default 128-GRF budget on
+      // BMG+ (see the cm_register_file_budget constraint), so this spills.
       matrix<float, 32, 64> acc = 0.0f;
     after: |
       // Either shrink the tile so the working set fits the budget, or raise the
-      // register file to 256 registers (double the budget) when the bigger tile
-      // is worth the lower occupancy. A single small tile like this one is only
+      // register file to 256 registers (16 KB on BMG+, double the budget) when
+      // the bigger tile is worth the lower occupancy. A single small tile like
+      // this one is only
       // 16*32*4 = 2048 B — it fits the default budget easily and does NOT need
       // large GRF.
       matrix<float, 16, 32> acc = 0.0f;
     description: |
       The register-file size is selected by the -Qxcm_register_file_size build
       option (not a source construct): 128 registers by default, or 256 in
-      "large GRF" mode. Sweep it as a "grf" knob TOGETHER with the tile/block
+      "large GRF" mode. On BMG+ (Battlemage / Xe2+, 64 B/register) that is an
+      8 KB per-thread budget at 128 GRF and 16 KB at 256 GRF. Sweep it as a
+      "grf" knob TOGETHER with the tile/block
       sizes, because the two interact: a larger register file lets a big
       register-blocked tile stay resident instead of spilling, but it halves the
       number of resident threads (lower occupancy and latency hiding). Use the
@@ -923,9 +926,11 @@ constraints:
         - register count = 128 by default, or 256 in "large GRF" mode (selected
           by the -Qxcm_register_file_size build option);
         - register width = 32 B on Xe-LP / Xe-HPG (Arc, Alchemist, and the
-          Xe-LPG iGPU in Meteor / Arrow Lake), 64 B on Xe-HPC (PVC) and Xe2+.
-      So the default budget is ~4 KB (32 B/reg) or ~8 KB (64 B/reg); large-GRF
-      mode doubles it. Estimate usage as the SUM of all simultaneously-live
+          Xe-LPG iGPU in Meteor / Arrow Lake), 64 B on Xe-HPC (PVC) and Xe2+
+          (Battlemage / BMG and later).
+      So on BMG+ (Xe2+, 64 B/register) the default 128-GRF budget is 8 KB and
+      large-GRF (256) is 16 KB; on the 32 B/register parts it is 4 KB / 8 KB.
+      Estimate usage as the SUM of all simultaneously-live
       tiles (accumulator + operands + unrolled temporaries), each elements x
       dtype bytes, and keep that total under the budget. A single small tile
       rarely spills; spills come from large register-blocked working sets. If a
