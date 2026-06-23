@@ -97,7 +97,7 @@ def generate_workspace(
     )
 
     _write_kernel_files(workspace, kernel_name, kernel_code, reference_code, spec_path, ext)
-    _symlink_knowledge_base(workspace)
+    _symlink_knowledge_base(workspace, dsl)
 
     if config.engine.git_init:
         _git_init(workspace)
@@ -121,12 +121,44 @@ def _write_kernel_files(
         shutil.copy2(spec_path, tk_dir / f"{kernel_name}.yaml")
 
 
-def _symlink_knowledge_base(workspace: Path) -> None:
-    """Create a symlink to the installed knowledge_base directory."""
-    kb_link = workspace / "knowledge_base"
-    if kb_link.exists() or kb_link.is_symlink():
+def _symlink_knowledge_base(workspace: Path, dsl: str) -> None:
+    """Expose only the DSL-relevant knowledge_base subdirectories.
+
+    Linking the entire knowledge_base would put other DSLs (triton, gluon,
+    sycl, ...) in front of the agent and waste its context. Instead, create a
+    workspace-local ``knowledge_base/`` directory and symlink only the active
+    DSL's folder plus the shared ``common`` folder.
+    """
+    kb_root = _find_knowledge_base_dir()
+    if kb_root is None:
         return
 
+    kb_dir = workspace / "knowledge_base"
+    # Leave any pre-existing knowledge_base (from a previous run) untouched.
+    if kb_dir.exists() or kb_dir.is_symlink():
+        return
+    kb_dir.mkdir(parents=True, exist_ok=True)
+
+    subdirs = [dsl]
+    # The shared `common` KB is model-level PyTorch/Triton guidance (nn.Module
+    # forward/init patterns, `.to("xpu")` correctness, kernel[grid] launches).
+    # None of it applies to the self-contained CM C++ kernels, so skip it for
+    # CM to avoid wasting the agent's context.
+    if dsl != DSL.CM:
+        subdirs.append("common")
+
+    for name in subdirs:
+        src = kb_root / name
+        if not src.is_dir():
+            continue
+        link = kb_dir / name
+        if link.exists() or link.is_symlink():
+            continue
+        link.symlink_to(src.resolve())
+
+
+def _find_knowledge_base_dir() -> Path | None:
+    """Locate the installed knowledge_base directory."""
     import xe_forge
 
     pkg_dir = Path(xe_forge.__file__).parent
@@ -137,8 +169,8 @@ def _symlink_knowledge_base(workspace: Path) -> None:
     ]
     for candidate in candidates:
         if candidate.is_dir():
-            kb_link.symlink_to(candidate.resolve())
-            return
+            return candidate.resolve()
+    return None
 
 
 def _git_init(workspace: Path) -> None:
