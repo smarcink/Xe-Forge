@@ -52,7 +52,7 @@ _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from scratch_pyopencl import (  # noqa: E402  (after sys.path tweak)
+from scratch_gemm import (  # noqa: E402  (after sys.path tweak)
     _type_label,
     extract_defines,
     pick_device,

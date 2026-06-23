@@ -17,10 +17,10 @@ NOTE: this device does NOT advertise ``cl_intel_vector_compute``, yet ``-cmc``
 works -- the VC backend is present, the extension string just isn't reported.
 
 Run (use the venv python; bare `python` is system 3.14 without deps):
-    python scratch_pyopencl.py --list                  # enumerate OpenCL devices
-    python scratch_pyopencl.py --cm k.cpp              # build + run + time cm_gemm
-    python scratch_pyopencl.py --cm k.cpp --m 512 --n 512 --k 512 --iters 50
-    python scratch_pyopencl.py --saxpy                 # OpenCL-C stack smoke test
+    python scratch_gemm.py --list                  # enumerate OpenCL devices
+    python scratch_gemm.py --cm k.cpp              # build + run + time cm_gemm
+    python scratch_gemm.py --cm k.cpp --m 512 --n 512 --k 512 --iters 50
+    python scratch_gemm.py --saxpy                 # OpenCL-C stack smoke test
 
 Input/output dtypes are read from the kernel's sibling ``.yaml`` spec (same path,
 ``.yaml`` suffix) -- override with ``--yaml PATH``; without a spec it falls back
