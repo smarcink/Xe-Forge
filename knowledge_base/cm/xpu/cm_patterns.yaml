@@ -127,10 +127,66 @@ patterns:
       on-device earlier in the same graph. When you CANNOT pre-pack (both operands
       are dynamic, or the harness forbids transforming inputs), the in-kernel
       equivalent is the hardware VNNI 2D block load (cm_load<lsc::VNNI>, see
-      cm_dpas_matmul) which at least moves the pack into the load hardware.
+      cm_dpas_matmul) which at least moves the pack into the load hardware -- or,
+      better still, re-orient the matmul so the operand that needs packing is the
+      small/dynamic one and the static weight stays row-major (see
+      cm_dpas_operand_role_choice).
     rationale: "Building the DPAS Src1 VNNI operand dominates a hand-packed GEMM's inner loop; pre-packing the static weight off-device turns it into a single contiguous load, and only the VNNI operand (not the row-major one) needs it."
     expected_speedup: "up to ~2x for a GEMM whose inner loop is dominated by the in-kernel VNNI pack (requires offline weight packing)"
     applies_to: [gemm, matmul, conv, dpas, int8, quantized, ffn]
+    requires: [xmx]
+
+  - id: cm_dpas_operand_role_choice
+    name: "Pick DPAS operand roles so the costly operand isn't VNNI-packed"
+    stage: device_specific
+    before: |
+      // A reused/static operand (or one stored transposed vs [K,N]) is being
+      // VNNI-packed for Src1 on every tile -- the pack dominates the DPAS loop,
+      // and the obvious mapping can end up SLOWER than the vector-FMA path.
+      // (e.g. a Linear weight stored [out,in]=[N,K], repacked to [K,N] every tile)
+    after: |
+      // DPAS computes  Acc[M,N] = A[M,K] (Src2, row-major) * B[K,N] (Src1, VNNI).
+      // The pack is the dominant cost -- so DECIDE which operand pays it. The
+      // transpose identity  C^T = B^T * A^T  lets EITHER physical tensor take the
+      // row-major Src2 (A) slot: compute the TRANSPOSED result and swap roles.
+      // Put the operand that is EXPENSIVE to pack (large / static / reused across
+      // tiles / awkwardly laid out) in the row-major Src2 (A) role -- it is then
+      // consumed in its NATIVE layout, never packed -- and VNNI-pack only the
+      // SMALL / dynamic / in-register operand as Src1 (B). Transpose the small
+      // result tile back in registers; that is far cheaper than repacking A.
+      //
+      // Worked example -- a Linear  out[t,o] = sum_k act[t,k]*W[o,k], W=[out,in]:
+      //   naive : A=act, B=W^T   -> must transpose+VNNI the big static weight.
+      //   better: compute  out^T[o,t] = W[o,k] * act^T[k,t]
+      //           A = W      (row-major [out,K]; loaded directly, NO transpose/pack)
+      //           B = act^T  (the small activation, VNNI-packed)
+      //           then transpose the [out,tok] result tile back to [tok,out].
+    description: |
+      Before reaching for an offline pre-pack (cm_operand_prepack) or a hardware
+      VNNI 2D load (cm_dpas_matmul), ask WHICH operand you are forced to pack --
+      the VNNI pack is what dominates DPAS feed, so assign the operand roles to
+      AVOID packing the expensive one. Because Acc = A*B and C^T = B^T*A^T, either
+      physical tensor can play the row-major Src2 (A); you pay only one small
+      in-register transpose of the result tile.
+      WHEN THIS FIRES (symptoms -- so it is recognizable on any kernel, not a
+      specific op):
+        - you are about to VNNI-pack an operand INSIDE the hot loop, or
+        - one operand is a STATIC tensor reused across many tiles while the other
+          is small / dynamic / produced in-register, or
+        - the operand you'd pack is stored TRANSPOSED relative to the [K,N] a VNNI
+          load wants (e.g. a Linear/conv weight stored [out,in]).
+      DECISION: orient the matmul so that operand becomes the row-major Src2 (A)
+      and the cheap/dynamic operand becomes the VNNI Src1 (B); transpose the small
+      result back.
+      This is the THIRD option the sibling patterns leave open: cm_operand_prepack
+      pre-packs the static weight OFFLINE, cm_dpas_matmul packs it via the HW VNNI
+      LOAD -- but when you CANNOT pre-pack (dynamic operands / the harness forbids
+      transforming inputs) AND the layout does not suit a VNNI load, re-orienting
+      avoids the pack ENTIRELY. Applies to any DPAS matmul -- standalone GEMM or
+      the linear projections fused inside attention / FFN / conv blocks.
+    rationale: "The VNNI pack dominates DPAS feed; the identity C^T=B^T*A^T lets the expensive operand stay row-major (unpacked) while only the small/dynamic one is packed -- which can flip DPAS from slower-than-FMA to far faster."
+    expected_speedup: "removes a per-tile VNNI repack from the inner loop -- multiples when the naive mapping is pack-bound"
+    applies_to: [gemm, matmul, dpas, attention, ffn, conv, fused, mixed_ops]
     requires: [xmx]
 
   - id: cm_simd_width

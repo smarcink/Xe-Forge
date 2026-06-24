@@ -828,19 +828,103 @@ def get_xpu_config_for_pipeline(
     return hw_config
 
 
-def format_device_capabilities_for_llm(has_xmx: bool = True) -> str:
-    """Render device matrix capabilities + hard constraints for prompts.
+@dataclass(frozen=True)
+class DevicePeaks:
+    """Per-architecture peak throughputs for the roofline shown to the LLM.
 
-    Shared by the optimizer config text and the analyzer problem context so the
-    wording stays identical. ``has_xmx`` defaults to True (capable): a host where
-    the device could not be queried preserves prior behavior, and a DO-NOT
-    directive is emitted only when the engine is explicitly absent (e.g. Xe-LPG /
-    Meteor Lake / Arrow Lake have no XMX systolic array).
+    These are NOT reported by the driver (OpenCL / torch expose the device name
+    and EU count, not TFLOPS), so they are known per-architecture constants. Add
+    a row per part you measure; an unmatched device resolves to ``None`` and the
+    prompt falls back to "measure empirically" instead of asserting a wrong peak.
     """
-    lines = [
-        "DEVICE CAPABILITIES:",
-        f"  XMX/DPAS systolic matmul: {'available' if has_xmx else 'NOT AVAILABLE'}",
-    ]
+
+    arch: str
+    has_xmx: bool
+    dpas_fp16_tflops: float | None   # systolic matmul peak (None when no XMX)
+    alu_fp16_tflops: float           # vector FMA peak
+    sfu_tflops: float                # special-function unit (exp/rsqrt/inv/log/...)
+    bandwidth_gbps: float            # HBM / VRAM bandwidth
+
+
+# Keyed table of known parts. Override selection with env XE_FORGE_DEVICE_ARCH=
+# <key> when the driver reports an opaque CI name (e.g. "Intel(R) Graphics d ...").
+_DEVICE_PEAKS: dict[str, DevicePeaks] = {
+    "bmg": DevicePeaks("Battlemage (BMG)", True, 120.0, 28.0, 3.5, 400.0),
+}
+
+# device-name substrings (lower-case) -> table key
+_DEVICE_NAME_ALIASES: list[tuple[tuple[str, ...], str]] = [
+    (("battlemage", "bmg", "arc b", "b580", "b570", "b380"), "bmg"),
+]
+
+
+def resolve_device_peaks(device_name: str | None) -> "DevicePeaks | None":
+    """Resolve a device name (or the XE_FORGE_DEVICE_ARCH override) to its peaks.
+
+    Returns None for an unknown device so the prompt degrades to "measure
+    empirically" rather than asserting an incorrect peak.
+    """
+    import os
+
+    override = os.environ.get("XE_FORGE_DEVICE_ARCH", "").strip().lower()
+    if override:
+        return _DEVICE_PEAKS.get(override)
+
+    name = (device_name or "").lower()
+    for aliases, key in _DEVICE_NAME_ALIASES:
+        if any(a in name for a in aliases):
+            return _DEVICE_PEAKS.get(key)
+    return None
+
+
+def format_device_capabilities_for_llm(
+    has_xmx: bool = True,
+    peaks: "DevicePeaks | None" = None,
+    device_name: str | None = None,
+) -> str:
+    """Render device matrix capabilities, peak throughputs + hard constraints.
+
+    Shared by the optimizer config text, the analyzer problem context, and the
+    Claude workspace generator so the wording stays identical. ``has_xmx``
+    defaults to True (capable). When ``peaks`` is given a multi-resource roofline
+    block (DPAS / ALU / SFU / bandwidth) is appended so the LLM can reason about
+    WHICH unit binds; when it is None the prompt says the peaks are unknown rather
+    than asserting a wrong number. A DO-NOT directive is emitted only when the
+    XMX engine is explicitly absent (e.g. Xe-LPG / Meteor Lake / Arrow Lake).
+    """
+    lines = ["DEVICE CAPABILITIES:"]
+    if device_name:
+        lines.append(f"  Device: {device_name}")
+    lines.append(
+        f"  XMX/DPAS systolic matmul: {'available' if has_xmx else 'NOT AVAILABLE'}"
+    )
+    if peaks is not None:
+        dpas = (
+            f"~{peaks.dpas_fp16_tflops:.0f} TFLOPS"
+            if peaks.dpas_fp16_tflops
+            else "n/a"
+        )
+        lines += [
+            "",
+            f"PEAK THROUGHPUT ({peaks.arch}):",
+            f"  DPAS/XMX fp16      : {dpas}   (matmul on the systolic array)",
+            f"  FP16 vector ALU    : ~{peaks.alu_fp16_tflops:.0f} TFLOPS   (everything NOT on DPAS)",
+            f"  SFU (exp/rsqrt/inv): ~{peaks.sfu_tflops:.1f} TFLOPS   (softmax / LayerNorm / GELU transcendentals -- the WEAKEST pipe)",
+            f"  HBM bandwidth      : ~{peaks.bandwidth_gbps:.0f} GB/s",
+            "ROOFLINE: put matmul on DPAS; the non-matmul tail runs on the much "
+            "lower ALU and SFU peaks. After each benchmark compute achieved "
+            "TFLOPS and the per-unit ideal time (work / peak) for DPAS, ALU, SFU "
+            "and memory -- the LARGEST is the binding bound. Tune toward it; do "
+            "NOT assume the DPAS peak is reachable when the kernel is ALU/SFU/"
+            "memory-bound.",
+        ]
+    elif has_xmx:
+        lines += [
+            "",
+            "PEAK THROUGHPUT: unknown for this device -- measure achieved TFLOPS "
+            "empirically (work / time) and compare DPAS vs vector-ALU vs SFU vs "
+            "memory; do NOT assume the DPAS peak.",
+        ]
     if not has_xmx:
         lines.append("")
         lines.append("HARD CONSTRAINTS (the target GPU lacks the feature below):")

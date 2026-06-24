@@ -40,6 +40,11 @@ import pathlib
 import re
 import sys
 
+# Surface the IGC/Vector-Compute build log (register usage, asm count, warnings)
+# instead of swallowing it behind pyopencl's CompilerWarning. Set BEFORE importing
+# pyopencl so it takes effect at build time. Override with PYOPENCL_COMPILER_OUTPUT=0.
+os.environ.setdefault("PYOPENCL_COMPILER_OUTPUT", "1")
+
 import numpy as np
 import pyopencl as cl
 import yaml
@@ -197,6 +202,10 @@ def run_swin(cm_path: str, yaml_path: str, variant: str, overrides: dict,
     src = pathlib.Path(cm_path).read_text()
     defines = extract_defines(src)
     win = defines.get("WIN", 4)
+    # WBLK windows are folded onto a single work-item along the W axis; the launch
+    # grid's W dimension is divided by it. The reference math (4x4 windows) is
+    # unchanged, so correctness still validates. Default 1 == original behaviour.
+    wblk = defines.get("WBLK", 1)
 
     input_specs, out_spec, dims, flop_formula = load_spec(yaml_path, variant, overrides)
 
@@ -248,12 +257,15 @@ def run_swin(cm_path: str, yaml_path: str, variant: str, overrides: dict,
     # Scalars: dims values in spec (insertion) order -> int32, matching the ABI.
     scalars = [np.int32(v) for v in dims.values()]
 
-    # Grid: one work-item per WIN x WIN window.
+    # Grid: one work-item per WIN x WIN window (or per WBLK windows along W).
     B, H, W = dims["B"], dims["H"], dims["W"]
     nH, nW = H // win, W // win
-    gsize = (B * nH, nW)
+    if nW % wblk != 0:
+        print(f"[fail] nW={nW} not divisible by WBLK={wblk}")
+        return 1
+    gsize = (B * nH, nW // wblk)
     lsize = (1, 1)
-    print(f"grid     : global={gsize} local={lsize}")
+    print(f"grid     : global={gsize} local={lsize}  (WBLK={wblk} windows/work-item)")
 
     queue = cl.CommandQueue(ctx, properties=cl.command_queue_properties.PROFILING_ENABLE)
     kernel = cl.Kernel(prg, entry)

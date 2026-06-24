@@ -7,6 +7,7 @@ rendered from Jinja templates under ``templates/``.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -16,6 +17,8 @@ from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from xe_forge.config import Config
 from xe_forge.models import DSL
+
+logger = logging.getLogger(__name__)
 
 _TEMPLATES_DIR = Path(__file__).parent / "templates"
 
@@ -30,6 +33,32 @@ _env = Environment(
 
 def _render(template_name: str, **context: object) -> str:
     return _env.get_template(template_name).render(**context)
+
+
+def _device_caps_block() -> str:
+    """Detect the GPU and render its capabilities + peak roofline for the prompt.
+
+    Best-effort: returns "" on any failure so the template degrades gracefully.
+    Peaks come from the per-architecture table in ``xpu_query`` (override the
+    match with env ``XE_FORGE_DEVICE_ARCH`` when the driver name is opaque).
+    """
+    try:
+        from xe_forge.core.xpu_query import (
+            format_device_capabilities_for_llm,
+            get_xpu_config,
+            resolve_device_peaks,
+        )
+
+        info = get_xpu_config()
+        name = getattr(info, "name", None)
+        return format_device_capabilities_for_llm(
+            has_xmx=getattr(info, "has_xmx", True),
+            peaks=resolve_device_peaks(name),
+            device_name=name,
+        )
+    except Exception as e:  # pragma: no cover - detection is best-effort
+        logger.debug("device caps detection failed: %s", e)
+        return ""
 
 
 def generate_workspace(
@@ -63,6 +92,7 @@ def generate_workspace(
             ext=ext,
             code_language=code_language,
             vtune_enabled=vtune_enabled,
+            device_caps=_device_caps_block(),
         ),
         encoding="utf-8",
     )
