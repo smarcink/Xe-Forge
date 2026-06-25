@@ -160,6 +160,79 @@ def stamp_build_directive(kernel_source: str, tokens: list[str]) -> str:
     return out + "\n" if trailing_nl else out
 
 
+# Grid-directive comment that lets a kernel OWN its launch grid instead of
+# inheriting the spec's. It is the mechanism by which an optimizer changes the
+# threads-vs-work-per-thread split — e.g. give each thread several output tiles
+# so a DPAS thread has enough rows to run at RepeatCount=8 and reuse each loaded
+# weight across more rows — WITHOUT editing the spec. Honored by compute_grid().
+GRID_DIRECTIVE_PREFIX = "// xe-forge-grid:"
+
+# Axis keys honored in a grid directive: the three global axes plus an optional
+# work-group (local) size per axis. Anything else is dropped with a warning so a
+# (possibly LLM-generated) comment cannot smuggle in unexpected keys.
+_GRID_DIRECTIVE_KEYS = {"x", "y", "z", "local.x", "local.y", "local.z"}
+
+
+def parse_grid_directive(kernel_source: str) -> dict[str, Any] | None:
+    """Extract a kernel-declared launch grid from ``// xe-forge-grid:`` line(s).
+
+    Returns a grid spec dict shaped exactly like the YAML ``grid:`` block —
+    ``{"x", "y", "z"}`` (plus an optional nested ``"local"``) of integer-or-
+    expression strings over problem dims and kernel ``#define``s — or ``None``
+    when no directive is present.
+
+    Format (one or more comment lines; ``;``-separated ``key = expr`` pairs, so an
+    expression may itself contain spaces)::
+
+        // xe-forge-grid: x = ceil(N * OH / PH); y = ceil(OW / PW); z = 1
+        // xe-forge-grid: local.x = LWS_X; local.y = LWS_Y
+
+    Expressions are NOT evaluated here; they flow through the same safe AST
+    evaluator as the YAML grid (see :func:`compute_grid` / :func:`_eval_axes`),
+    so only the allow-listed functions/operators over dims + ``#define``s are ever
+    computed — a directive can never execute arbitrary code.
+    """
+    pairs: list[str] = []
+    for line in kernel_source.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(GRID_DIRECTIVE_PREFIX):
+            continue
+        pairs.extend(stripped[len(GRID_DIRECTIVE_PREFIX):].split(";"))
+
+    spec: dict[str, Any] = {}
+    local: dict[str, Any] = {}
+    found = False
+    for pair in pairs:
+        if not pair.strip():
+            continue
+        if "=" not in pair:
+            logger.warning("Ignoring malformed // xe-forge-grid: entry (no '='): %r", pair.strip())
+            continue
+        key, _, value = pair.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key not in _GRID_DIRECTIVE_KEYS:
+            logger.warning(
+                "Ignoring unknown // xe-forge-grid: key %r (allowed: %s)",
+                key, sorted(_GRID_DIRECTIVE_KEYS),
+            )
+            continue
+        if not value:
+            logger.warning("Ignoring empty // xe-forge-grid: value for %r", key)
+            continue
+        found = True
+        if key.startswith("local."):
+            local[key.split(".", 1)[1]] = value
+        else:
+            spec[key] = value
+
+    if not found:
+        return None
+    if local:
+        spec["local"] = local
+    return spec
+
+
 def compute_grid(
     kernel_source: str,
     grid_spec: dict[str, Any] | None,
@@ -179,7 +252,15 @@ def compute_grid(
         ValueError: If the spec is malformed, references an undefined symbol, or an
             expression cannot be evaluated.
     """
-    if grid_spec is None:
+    # A kernel-declared // xe-forge-grid: directive OWNS the grid: it overrides
+    # the spec so an optimizer can change the threads-vs-work-per-thread split
+    # (e.g. own several output tiles per thread to fill the DPAS RepeatCount)
+    # without editing the spec.
+    directive_spec = parse_grid_directive(kernel_source)
+    if directive_spec is not None:
+        logger.info("Using kernel-declared // xe-forge-grid: directive (overrides spec grid)")
+        grid_spec = directive_spec
+    elif grid_spec is None:
         logger.warning("No grid specified; defaulting to ceil(M/BLOCK_M) x ceil(N/BLOCK_N)")
         grid_spec = dict(_DEFAULT_GRID)
 
@@ -202,9 +283,11 @@ def describe_grid_contract(grid_spec: dict[str, Any] | None, kernel_source: str)
     intersecting the grid formulas with the kernel's own ``#define``s — and shows
     the formulas plus each knob's current value. This tells the optimizer which
     ``#define``s it may tune and must not rename, whatever they happen to be
-    called in this kernel/spec.
+    called in this kernel/spec. If the kernel declares its own grid via a
+    ``// xe-forge-grid:`` directive, that grid is shown (it overrides the spec).
     """
-    effective = grid_spec or _DEFAULT_GRID
+    directive = parse_grid_directive(kernel_source)
+    effective = directive or grid_spec or _DEFAULT_GRID
     defines = extract_defines(kernel_source)
     local = effective.get("local")
     local = local if isinstance(local, dict) else None
@@ -259,8 +342,10 @@ def describe_grid_contract(grid_spec: dict[str, Any] | None, kernel_source: str)
         )
 
     return (
-        "The harness computes the launch grid from these formulas (you never set the "
-        "grid yourself):\n"
+        "The harness computes the launch grid from these formulas"
+        + (" (declared by this kernel's // xe-forge-grid: directive)"
+           if directive else " (from the spec)")
+        + ":\n"
         + "\n".join(formulas)
         + "\nFixed problem dimensions (set at runtime, not tunable): "
         + (", ".join(dims) if dims else "(none)")
@@ -271,7 +356,30 @@ def describe_grid_contract(grid_spec: dict[str, Any] | None, kernel_source: str)
         "above — do NOT rename it, remove it, inline its value, or turn it into an expression "
         "or function-like macro, or the grid can no longer be computed and the kernel is "
         "rejected."
+        + _grid_directive_help()
         + coop_note
+    )
+
+
+def _grid_directive_help() -> str:
+    """Steering paragraph: how (and why) a kernel may declare its OWN launch grid."""
+    return (
+        "\n\nDECLARE YOUR OWN GRID (// xe-forge-grid:) — the lever to change how much "
+        "work each thread owns: the formulas above are only the DEFAULT. You may OVERRIDE "
+        "the launch grid from inside the kernel with a comment line\n"
+        "    // xe-forge-grid: x = <expr>; y = <expr>; z = <expr>; local.x = <expr>; local.y = <expr>\n"
+        "whose expressions are over the problem dims and this kernel's integer #defines "
+        "(same functions as above: ceil/floor/min/max). The harness then launches THIS grid "
+        "instead of the spec's. This is the ONLY way to change the threads-vs-work-per-thread "
+        "split — and it is the key to filling the DPAS systolic array: if the spec maps one "
+        "thread per output element, a DPAS thread only has 1 row (RepeatCount=1) and cannot "
+        "reuse weights. Add a per-thread tile-count #define (e.g. PH, PW), DIVIDE the matching "
+        "grid axis by it in the directive so the harness launches proportionally FEWER threads, "
+        "and have each thread compute that whole tile of output elements — now the thread has "
+        "enough rows to run cm_dpas at RepeatCount=8 and amortize each loaded weight across the "
+        "tile. Index every thread's tile from cm_global_id(...) consistently with the grid you "
+        "declare, guard the tail, and keep the directive's expressions referencing only the "
+        "dims and integer #defines shown above."
     )
 
 

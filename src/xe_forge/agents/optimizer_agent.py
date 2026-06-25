@@ -568,10 +568,10 @@ class CMOptimizationSignature(dspy.Signature):
 
     === LAUNCH GRID & BLOCK-SIZE CONTRACT ===
     The per-thread tile sizes are integer `#define`s that ALSO drive the launch
-    grid: the harness re-derives the global and local work sizes from them, so
-    you never set the grid yourself. The `grid_contract` input lists the EXACT
-    knob names, formulas, and current values for THIS kernel — treat it as
-    authoritative and do not assume they are called BLOCK_M/BLOCK_N.
+    grid: by default the harness re-derives the global and local work sizes from
+    them. The `grid_contract` input lists the EXACT knob names, formulas, and
+    current values for THIS kernel — treat it as authoritative and do not assume
+    they are called BLOCK_M/BLOCK_N.
       - You MAY tune the #defines named in `grid_contract` for performance — the
         dispatch grid follows their values automatically, so changing a value
         stays correct.
@@ -579,12 +579,21 @@ class CMOptimizationSignature(dspy.Signature):
         SAME name shown in `grid_contract`. Do NOT rename it, remove it, inline
         its literal, or turn it into a computed expression/function-like macro,
         or grid computation fails and the kernel is rejected.
-      - Each thread owns one output tile — index it with cm_global_id(...) so it
-        stays correct at ANY group size. Some grid_contract knobs are work-group
-        (local) sizes: raising one forms a cooperative thread group whose threads
-        can SHARE an input tile through SLM. To exploit that, partition the shared
-        load across the group by cm_local_id(...), stage it once, fence +
-        cm_barrier, then have every thread read it back.
+      - You MAY OVERRIDE the launch grid from inside the kernel with a
+        `// xe-forge-grid: x = <expr>; y = <expr>; local.x = <expr>; ...` directive
+        (expressions over dims + this kernel's #defines). This is the ONLY way to
+        change how much work each thread owns. If the default grid maps one thread
+        per output element, a DPAS thread has just 1 row (RepeatCount=1) and cannot
+        reuse weights: add a per-thread tile-count #define, DIVIDE the matching
+        grid axis by it in the directive so the harness launches proportionally
+        FEWER threads, and have each thread compute that whole tile — now cm_dpas
+        can run at RepeatCount=8 and amortize each loaded weight across the tile.
+      - Each thread owns its output tile(s) — index them with cm_global_id(...) so
+        it stays correct at ANY grid you declare. Some grid_contract knobs are
+        work-group (local) sizes: raising one forms a cooperative thread group
+        whose threads can SHARE an input tile through SLM. To exploit that,
+        partition the shared load across the group by cm_local_id(...), stage it
+        once, fence + cm_barrier, then have every thread read it back.
 
     === CODE REQUIREMENTS ===
     - Must be complete, valid CM C++ with all required #include directives

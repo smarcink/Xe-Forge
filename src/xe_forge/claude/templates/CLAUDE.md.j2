@@ -95,6 +95,7 @@ xe-forge-skill trial finalize {{ kernel_name }} output/{{ kernel_name }}_optimiz
 - Keep the `extern "C" _GENX_MAIN_ void` entry point and `#include <cm/cm.h>`.
 - Correctness is checked by comparing the optimized kernel's output buffer against the baseline kernel's output (numpy). Preserve numerics within tolerance.
 - Choose the GRF (register-file) size with an in-source `// xe-forge-build: -Qxcm_register_file_size=256` directive when a candidate needs more registers.
+- **You may declare your own launch grid** with an in-source `// xe-forge-grid:` directive instead of inheriting the spec's. Expressions are over the spec's dims and this kernel's integer `#define`s (`ceil`/`floor`/`min`/`max` allowed); the harness launches THIS grid, so you do NOT edit the spec. Example: `// xe-forge-grid: x = ceil(M / BM); y = ceil(N / BN); local.x = 1; local.y = LWS`. Use it to change how much work each thread owns (e.g. divide a grid axis by a per-thread tile-count `#define` so fewer threads launch and each computes a larger output tile; index every element from `cm_global_id(...)` and guard the tail).
 - If you use SLM, call `cm_slm_fence(...)` before `cm_barrier()` and partition the cooperative work by `cm_local_id(...)`.
 - Read `knowledge_base/{{ dsl }}/{{ device }}/` (device-specific){% if dsl != 'cm' %} and `knowledge_base/common/` (shared){% endif %} for Intel Xe CM optimization patterns before writing each trial.
 {% else %}

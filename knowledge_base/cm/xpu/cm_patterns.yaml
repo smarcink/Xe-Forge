@@ -319,6 +319,12 @@ patterns:
       multiples of 8, and/or wider N) so each B tile is reused across even more
       rows: the more output a thread holds, the fewer times the shared weights are
       re-fetched, and the higher the arithmetic intensity.
+      HOW TO PUT MORE OUTPUT ON ONE THREAD: each thread owns more output only if
+      FEWER threads launch, so add a per-thread tile-count #define and declare a
+      coarser grid with a `// xe-forge-grid:` directive that DIVIDES the matching
+      grid axis by that count (expressions over dims + #defines). The default
+      one-thread-per-output-element grid forces RepeatCount=1; the directive is
+      what frees you to raise it.
       MAXIMIZE OPERAND (WEIGHT/TENSOR) REUSE FIRST: identify the operand that is
       shared across the most work (in a matmul/conv this is the weights / static
       tensor) and grow the tile along the dimension that reuses it the most, so it
