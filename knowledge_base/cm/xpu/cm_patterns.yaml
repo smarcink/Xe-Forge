@@ -285,6 +285,12 @@ patterns:
             acc.row(i) += a(i, kk) * brow;       // each load reused across the tile
         }
       }
+      // ON DPAS: the A-operand row count fed to each cm_dpas IS the RepeatCount
+      // (1..8), and the VNNI-packed Src1=B tile (weights / the reused static
+      // tensor) is shared across ALL those rows in ONE systolic pass. Map BLOCK_M
+      // so every cm_dpas runs at RepeatCount = 8 -> each B tile is amortized over
+      // the MAXIMUM rows. If the natural per-thread row count is < 8, COALESCE
+      // more INDEPENDENT output rows/positions into the thread until M reaches 8.
     description: |
       The foundational GEMM/conv optimization and the FIRST lever to try on a
       memory/latency-bound matmul — independent of whether the device has DPAS.
@@ -298,22 +304,42 @@ patterns:
       scheduler instruction-level parallelism to hide load + MAC latency (often
       more effective than source-level double-buffering on in-order EUs — measure
       before adding explicit prefetch).
-      TRADE-OFF: a bigger tile reuses more but uses more registers, which lowers
-      the number of resident threads (occupancy) and risks GRF spills that
-      collapse performance. The best tile is hardware-dependent — size it against
-      the register budget (see cm_register_file_budget) and let autotuning sweep
-      it (see cm_grf_register_file_size and cm_occupancy_balance). Pair larger
-      tiles with large GRF, smaller tiles with the default GRF for occupancy.
+      PREFER A FULL SYSTOLIC PASS (RepeatCount = 8) — THE MAIN LEVER ON DPAS: the
+      A-operand row count fed to each cm_dpas IS the RepeatCount (1..8), and every
+      VNNI-packed Src1=B tile (the weights / the reused static tensor) is shared
+      across ALL of those rows in a single systolic pass. So RepeatCount = 8
+      amortizes each loaded/packed B tile over the MAXIMUM number of MACs, while
+      RepeatCount < 8 BOTH wastes systolic throughput AND re-streams the same B
+      for too few rows. ALWAYS map the problem so the per-thread row count is a
+      multiple of 8 and each cm_dpas runs at RepeatCount = 8. If the natural
+      per-thread row count is below 8 (few output rows/positions), COALESCE more
+      INDEPENDENT output rows or output positions into ONE thread until you reach
+      8 — this is the single biggest lever for amortizing weight/tensor traffic
+      and keeping the array full. Then keep GROWING the tile (more rows in
+      multiples of 8, and/or wider N) so each B tile is reused across even more
+      rows: the more output a thread holds, the fewer times the shared weights are
+      re-fetched, and the higher the arithmetic intensity.
+      MAXIMIZE OPERAND (WEIGHT/TENSOR) REUSE FIRST: identify the operand that is
+      shared across the most work (in a matmul/conv this is the weights / static
+      tensor) and grow the tile along the dimension that reuses it the most, so it
+      is fetched as few times as possible.
+      TRADE-OFF — bigger tile = more reuse but more registers, fewer resident
+      threads (occupancy), and eventual GRF spills that collapse throughput.
+      Because a tall, reuse-maximizing accumulator needs many live registers, a
+      register-blocked DPAS tile almost ALWAYS needs the LARGE register file: set
+      `-Qxcm_register_file_size=256` (or the in-source `// xe-forge-build:`
+      directive) when you grow the tile, and do NOT drop back to the small GRF for
+      occupancy — the reuse a full tile buys outweighs the lost resident threads
+      (see cm_grf_register_file_size, cm_register_file_budget, cm_occupancy_balance).
       THE SWEET SPOT IS A CLIFF, NOT A SLOPE: reuse keeps improving as the tile
-      grows (MB*NB/(MB+NB)), but the moment the live accumulator+operand set
-      exceeds the register file the kernel SPILLS and throughput collapses
-      (measured roughly -80% going from a square-ish best tile to ~2x its DPAS-
-      atom count). So sweep the tile and STOP at the LARGEST one that does not
-      spill; the best tile is usually SQUARE-ISH (reuse ~2.0, e.g. ~16 DPAS
-      atoms), NOT the widest or tallest — past the atom ceiling more reuse never
-      pays back the spill.
-    rationale: "Reusing each loaded operand across a register-resident tile raises arithmetic intensity and feeds the ALUs/DPAS; it is the basis of all fast GEMM, with the tile size traded against occupancy and spills."
-    expected_speedup: "2-5x over a naive per-element kernel (problem- and hardware-dependent; tune the tile)"
+      grows (and as B is shared over more rows), but the moment the live
+      accumulator + operand set exceeds the register file the kernel SPILLS and
+      throughput collapses (measured roughly -80% past the cliff). So, holding
+      RepeatCount at 8, SWEEP the tile UPWARD and STOP at the LARGEST tile that
+      maximizes B (weight/tensor) reuse WITHOUT spilling — prefer the tallest
+      non-spilling tile that keeps the array full over a smaller "balanced" one.
+    rationale: "Reusing each loaded operand across a register-resident tile raises arithmetic intensity and feeds the ALUs/DPAS; on DPAS, map the per-thread rows to a FULL RepeatCount=8 systolic pass so each weight/tensor tile is amortized over the maximum MACs, then grow the tile (with the large GRF) to reuse weights across more rows until just before it spills."
+    expected_speedup: "2-5x over a naive per-element kernel; an under-filled RepeatCount (<8) or no weight reuse typically leaves ~2x on the table (problem- and hardware-dependent; tune the tile to just below the spill cliff)"
     applies_to: [gemm, matmul, conv, reduction]
 
   - id: cm_k_loop_pipeline
