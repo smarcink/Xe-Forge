@@ -200,8 +200,10 @@ def run_conv(cm_path: str, yaml_path: str, variant: str, overrides: dict,
     defines = extract_defines(src)
     lws_x = max(1, defines.get("LWS_X", 1))
     lws_y = max(1, defines.get("LWS_Y", 1))
-    # Pooled output pixels (along OW) each work-item computes (register blocking).
+    # Pooled output pixels each work-item computes (register blocking): PH_TILE
+    # along OH (rows), PW_TILE along OW (cols).
     pw_tile = max(1, defines.get("PW_TILE", 1))
+    ph_tile = max(1, defines.get("PH_TILE", 1))
 
     input_specs, out_spec, dims, flop_formula = load_spec(yaml_path, variant, overrides)
 
@@ -213,7 +215,7 @@ def run_conv(cm_path: str, yaml_path: str, variant: str, overrides: dict,
     print(f"device   : {device.name} ({_type_label(device)})")
     print(f"build    : clBuildProgram(options={build_opts!r})")
     print(f"spec     : {yaml_path}  variant={variant}")
-    print(f"dims     : {dims}  (LWS_X={lws_x} LWS_Y={lws_y} PW_TILE={pw_tile})")
+    print(f"dims     : {dims}  (LWS_X={lws_x} LWS_Y={lws_y} PH_TILE={ph_tile} PW_TILE={pw_tile})")
 
     ctx = cl.Context(devices=[device])
     try:
@@ -252,11 +254,11 @@ def run_conv(cm_path: str, yaml_path: str, variant: str, overrides: dict,
     # Scalars: dims values in spec (insertion) order -> int32, matching the ABI.
     scalars = [np.int32(v) for v in dims.values()]
 
-    # Grid: one work-item per pooled output row (N*OH) x block of PW_TILE pooled
-    # columns (ceil(OW/PW_TILE)), padded up to a multiple of the tunable work-group
-    # dims; local = (LWS_X, LWS_Y). The kernel guards the padded/blocked tail.
+    # Grid: x = N x ceil(OH/PH_TILE) blocks of PH_TILE pooled rows; y = ceil(OW/PW_TILE)
+    # blocks of PW_TILE pooled cols; both padded up to a multiple of the tunable
+    # work-group dims; local = (LWS_X, LWS_Y). The kernel guards the padded/blocked tail.
     N, OH, OW = dims["N"], dims["OH"], dims["OW"]
-    gx = math.ceil(N * OH / lws_x) * lws_x
+    gx = math.ceil(N * math.ceil(OH / ph_tile) / lws_x) * lws_x
     gy = math.ceil(math.ceil(OW / pw_tile) / lws_y) * lws_y
     gsize = (gx, gy)
     lsize = (lws_x, lws_y)
