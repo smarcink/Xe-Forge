@@ -1,0 +1,37 @@
+
+inputs:
+  X:
+    shape: [N, H, W, CIN]
+    dtype: float16
+  weight:
+    shape: [KH, KW, CIN, COUT]
+    dtype: float16
+  bias:
+    shape: [COUT]
+    dtype: float16
+
+outputs:
+  Y:
+    shape: [N, OH, OW, COUT]
+    dtype: float16
+
+grid:
+  x: "ceil(N * OH / LWS_X) * LWS_X"
+  y: "ceil(OW / LWS_Y) * LWS_Y"
+  z: 1
+  local:
+    x: LWS_X
+    y: LWS_Y
+    z: 1
+
+# Small correctness shape (fast).
+ci:
+  - params: [X, weight, bias]
+    dims: {N: 1, CIN: 128, COUT: 128, H: 32, W: 32, KH: 3, KW: 3, OH: 16, OW: 16}
+    flop: "2*N*COUT*H*W*CIN*KH*KW"
+
+# Full workload from get_inputs().
+bench-gpu:
+  - params: [X, weight, bias]
+    dims: {N: 1, CIN: 128, COUT: 128, H: 360, W: 640, KH: 3, KW: 3, OH: 180, OW: 320}
+    flop: "2*N*COUT*H*W*CIN*KH*KW"
