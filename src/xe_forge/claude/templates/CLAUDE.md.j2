@@ -55,7 +55,7 @@ All runtime behavior below is gated by these values; re-read `config.yaml` if an
 ### Step 1: Analyze
 - Read the baseline source file `test_kernels/{{ kernel_name }}{{ ext }}`. Identify shapes, dtypes, operations.
 {% if code_language == 'python' %}- Run `xe-forge-skill analyze test_kernels/{{ kernel_name }}{{ ext }}` to get AST-based analysis.
-{% endif %}- Read relevant knowledge_base/{% if code_language == 'cpp' %}{{ dsl }}/{{ device }}/{% if dsl != 'cm' %} and knowledge_base/common/{% endif %}{% endif %} files for optimization patterns.
+{% endif %}- Read relevant knowledge_base/{% if code_language == 'cpp' %}{{ dsl }}/{{ device }}/ and knowledge_base/common/{% endif %} files for optimization patterns.
 {% if code_language == 'cpp' %}- **Find the dominant op & estimate the roofline FIRST.** Determine whether the kernel is compute- or memory-bound and which operation dominates the FLOPs, then attack the highest-ceiling bottleneck before any incremental tuning — do NOT spend early trials on small local tweaks when a larger structural win is available.
 {% if dsl == 'cm' %}- **If the dominant cost is matmul/GEMM and the baseline is NOT already using the systolic array (`cm_dpas`), make porting it to DPAS your FIRST trial.** It is almost always the single largest win (often 5–20x); the vector-FMA path tops out far below the systolic peak, so reaching it only after a plateau wastes the biggest lever. See knowledge_base patterns `cm_dpas_matmul` and `cm_dpas_operand_role_choice` (the latter keeps the static weights un-packed so DPAS actually beats FMA).
 {% endif %}{% endif %}
@@ -97,7 +97,7 @@ xe-forge-skill trial finalize {{ kernel_name }} output/{{ kernel_name }}_optimiz
 - Choose the GRF (register-file) size with an in-source `// xe-forge-build: -Qxcm_register_file_size=256` directive when a candidate needs more registers.
 - **You may declare your own launch grid** with an in-source `// xe-forge-grid:` directive instead of inheriting the spec's. Expressions are over the spec's dims and this kernel's integer `#define`s (`ceil`/`floor`/`min`/`max` allowed); the harness launches THIS grid, so you do NOT edit the spec. Example: `// xe-forge-grid: x = ceil(M / BM); y = ceil(N / BN); local.x = 1; local.y = LWS`. Use it to change how much work each thread owns (e.g. divide a grid axis by a per-thread tile-count `#define` so fewer threads launch and each computes a larger output tile; index every element from `cm_global_id(...)` and guard the tail).
 - If you use SLM, call `cm_slm_fence(...)` before `cm_barrier()` and partition the cooperative work by `cm_local_id(...)`.
-- Read `knowledge_base/{{ dsl }}/{{ device }}/` (device-specific){% if dsl != 'cm' %} and `knowledge_base/common/` (shared){% endif %} for Intel Xe CM optimization patterns before writing each trial.
+- Read `knowledge_base/{{ dsl }}/{{ device }}/` (device-specific) and `knowledge_base/common/` (shared) for Intel Xe CM optimization patterns before writing each trial.
 {% else %}
 - NO default values for `@triton.autotune` meta-parameters in kernel signature
 - Use 1D grid when applying tile swizzling (GROUP_SIZE_M)
